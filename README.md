@@ -6,6 +6,21 @@ model and opening prompt.
 
 ## Install
 
+Requires [`uv`](https://docs.astral.sh/uv/) and `claude` (Claude Code) on your
+`PATH` — `claude-team` just launches named `claude` sessions.
+
+### From GitHub (no clone)
+
+```bash
+uv tool install git+https://github.com/jesshart/claude-team   # installs `claude-team` + `cteam`
+# or run once, without installing:
+uvx --from git+https://github.com/jesshart/claude-team claude-team --help
+```
+
+Pin a version with `@`, e.g. `git+https://github.com/jesshart/claude-team@v0.1.0`.
+
+### From a local clone
+
 ```bash
 cd claude-team
 uv tool install .          # installs `claude-team` and the short alias `cteam`
