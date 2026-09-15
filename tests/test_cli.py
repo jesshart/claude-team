@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import subprocess
 
 import pytest
@@ -11,22 +12,71 @@ from claude_team import cli
 from claude_team.cli import (
     BOSS,
     CHECK_IN_PROMPT,
+    ColumnsLayout,
     DEVELOPER,
     FABLE,
+    Herdr,
+    HerdrError,
     LaunchPlan,
+    LeftStackLayout,
     OPUS_48,
     QA,
+    SplitStep,
     app,
+    boss_prompts,
     build_command,
     build_name,
+    claude_team_invocation,
     classify_team,
     decide_background,
     detect_state,
     extract_session_id,
+    get_layout,
+    pane_launch_command,
+    pane_run_argv,
+    pane_split_argv,
     parse_roles,
+    place_team,
+    role_token,
+    workspace_create_argv,
+    worktree_create_argv,
 )
 
 runner = CliRunner()
+
+
+# --- Fake herdr subsystem (drives the Herdr facade in tests) -------------
+class FakeHerdrRunner:
+    """Records `herdr <args>` calls and returns canned JSON, no live server."""
+
+    def __init__(self):
+        self.calls = []
+        self._pane_seq = 1
+
+    def __call__(self, args):
+        self.calls.append(args)
+        return subprocess.CompletedProcess(
+            args, 0, stdout=json.dumps({"id": "x", "result": self._result(args)}), stderr=""
+        )
+
+    def _result(self, args):
+        head = args[:2]
+        if head == ["workspace", "create"]:
+            return {"workspace": {"workspace_id": "w1"}, "tab": {"tab_id": "w1:t1"},
+                    "root_pane": {"pane_id": "w1:p1"}}
+        if head == ["worktree", "create"]:
+            return {"workspace": {"workspace_id": "w2", "worktree": {"checkout_path": "/co"}},
+                    "root_pane": {"pane_id": "w2:p1"}}
+        if head == ["pane", "split"]:
+            self._pane_seq += 1
+            return {"pane": {"pane_id": f"w1:p{self._pane_seq}"}}
+        if head == ["agent", "list"]:
+            return {"agents": []}
+        return {"type": "ok"}
+
+    def pane_runs(self):
+        """(pane_id, command) for each `pane run`, in call order."""
+        return [(c[2], c[3]) for c in self.calls if c[:2] == ["pane", "run"]]
 
 
 # --- build_name ----------------------------------------------------------
@@ -404,3 +454,349 @@ def test_quickstart_guide_mentions_roles_and_attach(monkeypatch):
     assert "## Current state" in result.stdout
     assert "claude attach <id>" in result.stdout
     assert "Check in with boss" in result.stdout
+
+
+# --- role_token ----------------------------------------------------------
+def test_role_token_maps_each_role_to_its_subcommand():
+    assert role_token(BOSS) == "boss"
+    assert role_token(DEVELOPER) == "dev"
+    assert role_token(QA) == "qa"
+
+
+# --- Strategy: pane layouts ----------------------------------------------
+def test_left_stack_layout_single_pane_has_no_splits():
+    assert LeftStackLayout().plan(1) == []
+
+
+def test_left_stack_layout_two_panes_split_right_evenly():
+    assert LeftStackLayout().plan(2) == [SplitStep(0, "right", 0.5)]
+
+
+def test_left_stack_layout_three_panes_boss_left_two_stacked_right():
+    assert LeftStackLayout().plan(3) == [
+        SplitStep(0, "right", 0.5),
+        SplitStep(1, "down", 0.5),
+    ]
+
+
+def test_left_stack_layout_four_panes_even_right_column_rows():
+    # right column of 3 rows: down-splits hand out 1/3 then 1/2 of the remainder
+    assert LeftStackLayout().plan(4) == [
+        SplitStep(0, "right", 0.5),
+        SplitStep(1, "down", 1.0 / 3.0),
+        SplitStep(2, "down", 0.5),
+    ]
+
+
+def test_columns_layout_three_even_columns():
+    # peel one even column each time: keep 1/3, then 1/2 of the remainder
+    assert ColumnsLayout().plan(3) == [
+        SplitStep(0, "right", 1.0 / 3.0),
+        SplitStep(1, "right", 0.5),
+    ]
+
+
+def test_layout_rejects_zero_panes():
+    with pytest.raises(ValueError):
+        LeftStackLayout().plan(0)
+
+
+def test_get_layout_resolves_and_rejects():
+    assert get_layout("left-stack").name == "left-stack"
+    assert get_layout("columns").name == "columns"
+    with pytest.raises(cli.typer.BadParameter):
+        get_layout("spiral")
+
+
+# --- argv builders -------------------------------------------------------
+def test_workspace_create_argv():
+    assert workspace_create_argv("/x", "lbl") == [
+        "workspace", "create", "--cwd", "/x", "--label", "lbl", "--no-focus"
+    ]
+
+
+def test_worktree_create_argv():
+    assert worktree_create_argv("/repo", "br", "origin/dev", "br") == [
+        "worktree", "create", "--cwd", "/repo", "--branch", "br",
+        "--base", "origin/dev", "--label", "br", "--no-focus",
+    ]
+
+
+def test_pane_split_argv_formats_ratio_and_omits_when_none():
+    with_ratio = pane_split_argv("w1:p1", SplitStep(0, "right", 0.5), "/x")
+    assert with_ratio == [
+        "pane", "split", "w1:p1", "--direction", "right",
+        "--ratio", "0.5000", "--cwd", "/x", "--no-focus",
+    ]
+    no_ratio = pane_split_argv("w1:p1", SplitStep(0, "down", None), "/x")
+    assert "--ratio" not in no_ratio
+
+
+def test_pane_run_argv_passes_command_as_single_arg():
+    assert pane_run_argv("w1:p2", "echo hi") == ["pane", "run", "w1:p2", "echo hi"]
+
+
+# --- claude_team_invocation ----------------------------------------------
+def test_invocation_prefers_durably_installed_claude_team():
+    which = lambda name: "/Users/j/.local/bin/claude-team" if name == "claude-team" else None
+    assert claude_team_invocation(which=which, env={}) == ["claude-team"]
+
+
+def test_invocation_ignores_claude_team_from_transient_uv_venv():
+    # A claude-team that lives inside the active VIRTUAL_ENV is not durable for a
+    # fresh pane shell, so fall back to the `uv run --project` form.
+    def which(name):
+        return {"claude-team": "/tmp/venv/bin/claude-team", "uv": "/usr/bin/uv"}.get(name)
+
+    got = claude_team_invocation(which=which, package_root="/clone", env={"VIRTUAL_ENV": "/tmp/venv"})
+    assert got == ["uv", "run", "--project", "/clone", "claude-team"]
+
+
+def test_invocation_falls_back_to_uv_run_when_not_installed():
+    which = lambda name: "/usr/bin/uv" if name == "uv" else None
+    got = claude_team_invocation(which=which, package_root="/clone", env={})
+    assert got == ["uv", "run", "--project", "/clone", "claude-team"]
+
+
+def test_invocation_last_resort_is_this_interpreter_and_module():
+    got = claude_team_invocation(which=lambda name: None, env={})
+    assert got == [cli.sys.executable, "-m", "claude_team.cli"]
+
+
+# --- pane_launch_command -------------------------------------------------
+def test_pane_launch_command_appends_fg_and_role_token():
+    cmd = pane_launch_command(["claude-team"], DEVELOPER, "PROJ-1", None)
+    assert cmd == "claude-team dev PROJ-1 --fg"
+
+
+def test_pane_launch_command_includes_suffix():
+    cmd = pane_launch_command(["claude-team"], QA, "PROJ-1", "Handoff 2")
+    assert cmd == "claude-team qa PROJ-1 --suffix 'Handoff 2' --fg"
+
+
+def test_pane_launch_command_quotes_hostile_topic_safely():
+    cmd = pane_launch_command(["ct"], BOSS, "a b | c && rm -rf ~", None)
+    # round-trips through shlex, so the whole topic is a single inert token
+    assert cli.shlex.split(cmd) == ["ct", "boss", "a b | c && rm -rf ~", "--fg"]
+
+
+# --- Facade: Herdr -------------------------------------------------------
+def test_herdr_create_workspace_parses_ids():
+    fake = FakeHerdrRunner()
+    ws, pane = Herdr(fake).create_workspace("/x", "lbl")
+    assert (ws, pane) == ("w1", "w1:p1")
+    assert fake.calls[0] == workspace_create_argv("/x", "lbl")
+
+
+def test_herdr_create_worktree_returns_checkout():
+    ws, pane, checkout = Herdr(FakeHerdrRunner()).create_worktree("/r", "b", "origin/dev", "b")
+    assert (ws, pane, checkout) == ("w2", "w2:p1", "/co")
+
+
+def test_herdr_split_returns_new_pane_id():
+    assert Herdr(FakeHerdrRunner()).split("w1:p1", SplitStep(0, "right", 0.5), "/x") == "w1:p2"
+
+
+def test_herdr_raises_on_nonzero_exit():
+    def boom(args):
+        return subprocess.CompletedProcess(args, 1, stdout="", stderr="socket gone\n")
+
+    with pytest.raises(HerdrError, match="socket gone"):
+        Herdr(boom).create_workspace("/x", "l")
+
+
+def test_herdr_raises_on_error_payload():
+    def err(args):
+        return subprocess.CompletedProcess(
+            args, 0, stdout=json.dumps({"error": {"code": "not_git_worktree"}}), stderr=""
+        )
+
+    with pytest.raises(HerdrError, match="not_git_worktree"):
+        Herdr(err).create_workspace("/x", "l")
+
+
+def test_herdr_raises_on_non_json():
+    def junk(args):
+        return subprocess.CompletedProcess(args, 0, stdout="not json", stderr="")
+
+    with pytest.raises(HerdrError, match="non-JSON"):
+        Herdr(junk).create_workspace("/x", "l")
+
+
+def test_herdr_wait_for_output_swallows_errors():
+    def boom(args):
+        return subprocess.CompletedProcess(args, 1, stdout="", stderr="timeout")
+
+    # Best-effort boot probe must never raise.
+    Herdr(boom).wait_for_output("w1:p1", "x", 10)
+
+
+# --- Director: place_team ------------------------------------------------
+def test_place_team_splits_then_launches_boss_first():
+    fake = FakeHerdrRunner()
+    herdr = Herdr(fake)
+    placements = place_team(
+        herdr, LeftStackLayout(), "w1:p1", "/x",
+        [BOSS, DEVELOPER, QA], "TOPIC", None, ["claude-team"],
+    )
+    # boss keeps the root pane; the two splits create p2, p3
+    assert placements == [(BOSS, "w1:p1"), (DEVELOPER, "w1:p2"), (QA, "w1:p3")]
+    # each role launched foreground in its pane, boss first
+    assert fake.pane_runs() == [
+        ("w1:p1", "claude-team boss TOPIC --fg"),
+        ("w1:p2", "claude-team dev TOPIC --fg"),
+        ("w1:p3", "claude-team qa TOPIC --fg"),
+    ]
+
+
+def test_place_team_single_role_no_splits():
+    fake = FakeHerdrRunner()
+    place_team(Herdr(fake), LeftStackLayout(), "w1:p1", "/x", [BOSS], "T", None, ["ct"])
+    assert not [c for c in fake.calls if c[:2] == ["pane", "split"]]
+    assert fake.pane_runs() == [("w1:p1", "ct boss T --fg")]
+
+
+# --- CLI: space / worktree dry-run + guard -------------------------------
+@pytest.fixture
+def installed_ct(monkeypatch):
+    """Make invocation deterministic: claude-team is durably installed."""
+    monkeypatch.delenv("VIRTUAL_ENV", raising=False)
+    monkeypatch.setattr(
+        cli.shutil, "which",
+        lambda name: "/opt/bin/claude-team" if name == "claude-team" else None,
+    )
+
+
+def test_space_dry_run_previews_workspace_and_launches(installed_ct):
+    result = runner.invoke(app, ["space", "DEMO", "--dry-run"])
+    assert result.exit_code == 0
+    assert "herdr workspace create --cwd" in result.stdout
+    assert "# layout: left-stack, 3 pane(s)" in result.stdout
+    assert "[boss] claude-team boss DEMO --fg" in result.stdout
+    assert "[qa] claude-team qa DEMO --fg" in result.stdout
+
+
+def test_space_dry_run_respects_layout_and_roles(installed_ct):
+    result = runner.invoke(
+        app, ["space", "DEMO", "--layout", "columns", "--roles", "boss,qa", "--dry-run"]
+    )
+    assert result.exit_code == 0
+    assert "# layout: columns, 2 pane(s)" in result.stdout
+    assert "dev DEMO" not in result.stdout
+
+
+def test_worktree_dry_run_previews_worktree_create(installed_ct):
+    result = runner.invoke(
+        app, ["worktree", "my-branch", "--repo", "/repo", "--dry-run"]
+    )
+    assert result.exit_code == 0
+    assert "herdr worktree create --cwd /repo --branch my-branch --base origin/dev" in result.stdout
+    assert "[boss] claude-team boss my-branch --fg" in result.stdout
+
+
+def test_space_requires_herdr_env_when_not_dry_run(installed_ct, monkeypatch):
+    monkeypatch.delenv("HERDR_ENV", raising=False)
+    # Must never actually talk to herdr when the guard fails.
+    monkeypatch.setattr(cli, "default_herdr_runner", lambda args: 1 / 0)
+    result = runner.invoke(app, ["space", "DEMO"])
+    assert result.exit_code != 0
+    assert "not inside a Herdr session" in result.output
+
+
+def test_space_real_run_reports_workspace_and_panes(installed_ct, monkeypatch):
+    fake = FakeHerdrRunner()
+    monkeypatch.setenv("HERDR_ENV", "1")
+    monkeypatch.setattr(cli, "default_herdr_runner", fake)
+    monkeypatch.setattr(cli, "herdr_available", lambda which=None: True)
+
+    result = runner.invoke(app, ["space", "DEMO", "--no-wait"])
+    assert result.exit_code == 0, result.output
+    assert "✓ workspace w1" in result.stdout
+    assert "Boss" in result.stdout and "w1:p1" in result.stdout
+    assert "teardown: herdr workspace close w1" in result.stdout
+    # boss launched first, in the root pane
+    assert fake.pane_runs()[0] == ("w1:p1", "claude-team boss DEMO --fg")
+
+
+# --- prompt overrides: boss --prompt / space|worktree --boss-prompt -------
+def test_build_command_prompt_overrides_role_default():
+    # boss has no default prompt; --prompt supplies one
+    assert build_command(BOSS, "T", None, background=False, prompt="/resume x") == [
+        "claude", "--name", "Boss: T", "--model", "fable", "/resume x",
+    ]
+    # dev's "Check in with boss" default is overridden
+    cmd = build_command(DEVELOPER, "T", None, background=False, prompt="do this")
+    assert cmd[-1] == "do this" and "Check in with boss" not in cmd
+
+
+def test_build_command_no_prompt_keeps_role_default():
+    cmd = build_command(DEVELOPER, "T", None, background=False)
+    assert cmd[-1] == "Check in with boss"
+
+
+def test_launch_plan_carries_prompt_into_argv():
+    plan = LaunchPlan(BOSS, "T", None, background=True, prompt="/resume x")
+    assert plan.argv()[-1] == "/resume x"
+
+
+def test_pane_launch_command_includes_prompt():
+    cmd = pane_launch_command(["claude-team"], BOSS, "T", None, prompt="/resume_handoff a b.md")
+    assert cmd == "claude-team boss T --prompt '/resume_handoff a b.md' --fg"
+
+
+def test_boss_prompts_maps_boss_when_selected():
+    assert boss_prompts([BOSS, DEVELOPER, QA], "/resume x") == {BOSS: "/resume x"}
+
+
+def test_boss_prompts_empty_without_prompt():
+    assert boss_prompts([BOSS], None) == {}
+
+
+def test_boss_prompts_warns_when_boss_not_selected(capsys):
+    assert boss_prompts([DEVELOPER, QA], "/resume x") == {}
+    assert "boss" in capsys.readouterr().err.lower()
+
+
+def test_place_team_applies_boss_prompt_only_to_boss():
+    fake = FakeHerdrRunner()
+    place_team(
+        Herdr(fake), LeftStackLayout(), "w1:p1", "/x",
+        [BOSS, DEVELOPER], "T", None, ["ct"], {BOSS: "/resume x"},
+    )
+    runs = dict(fake.pane_runs())
+    assert runs["w1:p1"] == "ct boss T --prompt '/resume x' --fg"  # boss carries it
+    assert runs["w1:p2"] == "ct dev T --fg"                        # dev does not
+
+
+def test_boss_prompt_cli_dry_run(terminal_env):
+    result = runner.invoke(app, ["boss", "T", "--prompt", "/resume_handoff h.md", "--dry-run"])
+    assert result.exit_code == 0
+    assert result.stdout.strip() == "claude --name 'Boss: T' --model fable '/resume_handoff h.md'"
+
+
+def test_space_boss_prompt_dry_run(installed_ct):
+    result = runner.invoke(
+        app,
+        ["space", "T", "--roles", "boss,dev", "--boss-prompt", "/resume_handoff h.md", "--dry-run"],
+    )
+    assert result.exit_code == 0
+    assert "[boss] claude-team boss T --prompt '/resume_handoff h.md' --fg" in result.stdout
+    assert "[dev] claude-team dev T --fg" in result.stdout  # dev unaffected
+
+
+def test_worktree_boss_prompt_dry_run(installed_ct):
+    result = runner.invoke(
+        app,
+        ["worktree", "br", "--repo", "/r", "--roles", "boss", "--boss-prompt", "/resume h.md", "--dry-run"],
+    )
+    assert result.exit_code == 0
+    assert "[boss] claude-team boss br --prompt '/resume h.md' --fg" in result.stdout
+
+
+def test_space_boss_prompt_ignored_when_boss_not_in_roles(installed_ct):
+    result = runner.invoke(
+        app, ["space", "T", "--roles", "dev,qa", "--boss-prompt", "/x", "--dry-run"]
+    )
+    assert result.exit_code == 0
+    assert "--prompt" not in result.stdout          # not applied
+    assert "warning" in result.output.lower()       # but warned (stderr)

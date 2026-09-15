@@ -21,8 +21,10 @@ import shlex
 import shutil
 import subprocess
 import sys
+from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Callable, List, Mapping, Optional
+from pathlib import Path
+from typing import Callable, List, Mapping, Optional, Tuple
 
 import typer
 
@@ -78,14 +80,26 @@ def decide_background(
     return (not isatty) or ("CLAUDECODE" in env)
 
 
-def build_command(role: Role, topic: str, suffix: Optional[str], background: bool) -> List[str]:
-    """Build the ``claude`` argv for ``role``."""
+def build_command(
+    role: Role,
+    topic: str,
+    suffix: Optional[str],
+    background: bool,
+    prompt: Optional[str] = None,
+) -> List[str]:
+    """Build the ``claude`` argv for ``role``.
+
+    ``prompt`` overrides the role's default opening prompt when given — e.g. a
+    ``/resume_handoff …`` slash command for the boss, which otherwise opens with
+    no prompt. Pass ``None`` to keep the role default.
+    """
     cmd = ["claude"]
     if background:
         cmd.append("--bg")
     cmd += ["--name", build_name(role, topic, suffix), "--model", role.model]
-    if role.prompt:
-        cmd.append(role.prompt)
+    effective = prompt if prompt is not None else role.prompt
+    if effective:
+        cmd.append(effective)
     return cmd
 
 
@@ -140,13 +154,16 @@ class LaunchPlan:
     topic: str
     suffix: Optional[str]
     background: bool
+    prompt: Optional[str] = None
 
     @property
     def name(self) -> str:
         return build_name(self.role, self.topic, self.suffix)
 
     def argv(self) -> List[str]:
-        return build_command(self.role, self.topic, self.suffix, self.background)
+        return build_command(
+            self.role, self.topic, self.suffix, self.background, self.prompt
+        )
 
     def preview(self) -> str:
         return shlex.join(self.argv())
@@ -179,10 +196,14 @@ def launch(
     suffix: Optional[str],
     background_override: Optional[bool],
     dry_run: bool,
+    prompt: Optional[str] = None,
 ) -> None:
-    """Build the invocation for ``role`` and start it (or preview it)."""
+    """Build the invocation for ``role`` and start it (or preview it).
+
+    ``prompt`` overrides the role's default opening prompt when given.
+    """
     background = decide_background(background_override, os.environ, stdout_isatty())
-    plan = LaunchPlan(role, topic, suffix, background)
+    plan = LaunchPlan(role, topic, suffix, background, prompt)
 
     if dry_run:
         typer.echo(plan.preview())
@@ -228,6 +249,371 @@ def launch_team(plans: List[LaunchPlan], dry_run: bool) -> None:
             failures += 1
             typer.echo(f"  ✗ {plan.name}  (launch failed, rc={result.returncode})")
     raise typer.Exit(1 if failures else 0)
+
+
+# --- Herdr: place a team into terminal panes -----------------------------
+# Herdr (https://herdr.dev) is a terminal workspace manager for coding agents.
+# From inside a Herdr pane, the `herdr` binary drives the running session over a
+# socket and returns JSON. These helpers create a workspace (or git worktree),
+# lay panes out deterministically, and launch one role foreground per pane —
+# where each pane just re-invokes *this* CLI (reusing the LaunchPlan command
+# pattern) for a single role with `--fg`.
+#
+# Three patterns from the GoF catalog carry the weight here:
+#   * Strategy  — interchangeable pane-layout algorithms (`LayoutStrategy`).
+#   * Facade    — `Herdr` hides the subprocess + JSON of the `herdr` CLI behind
+#                 a few semantic operations; the commands never see either.
+#   * Command   — the per-pane launch is `claude-team <role> --fg`, which builds
+#                 and runs a `LaunchPlan` just like the standalone commands do.
+
+BOOT_REGEX = "shortcuts|Welcome|bypass|Claude Code|esc to"
+
+# Re-invoke this same CLI for one role, so a token maps back to its subcommand.
+ROLE_TOKEN = {BOSS: "boss", DEVELOPER: "dev", QA: "qa"}
+
+
+def role_token(role: Role) -> str:
+    """The CLI subcommand token that launches ``role`` (boss / dev / qa)."""
+    return ROLE_TOKEN[role]
+
+
+@dataclass(frozen=True)
+class SplitStep:
+    """One `herdr pane split`.
+
+    Split the pane at index ``source`` (into the *growing* list of panes, where
+    index 0 is the workspace's root pane) in ``direction`` (``right`` | ``down``).
+    ``ratio`` is the fraction of space **kept by the original** pane; the new
+    pane gets ``1 - ratio``. ``None`` leaves it to herdr's default.
+    """
+
+    source: int
+    direction: str
+    ratio: Optional[float] = None
+
+
+# --- Strategy: pane-layout algorithms ------------------------------------
+class LayoutStrategy(ABC):
+    """A family of interchangeable layout algorithms.
+
+    Each turns a pane count into a deterministic list of :class:`SplitStep`, so
+    the same role set always produces the same geometry, run after run.
+    """
+
+    name: str
+
+    @abstractmethod
+    def plan(self, n: int) -> List[SplitStep]:
+        """Return the splits that grow one root pane into ``n`` panes."""
+
+
+class LeftStackLayout(LayoutStrategy):
+    """Boss takes the left half full-height; the rest stack evenly in the right
+    column, top to bottom. 3 roles → boss left, dev top-right, qa bottom-right."""
+
+    name = "left-stack"
+
+    def plan(self, n: int) -> List[SplitStep]:
+        if n < 1:
+            raise ValueError("need at least one pane")
+        steps: List[SplitStep] = []
+        if n >= 2:
+            steps.append(SplitStep(source=0, direction="right", ratio=0.5))
+        # Even rows in the right column: the i-th down-split hands the new pane
+        # 1/(rows-left) of the shrinking remainder.
+        for i in range(1, n - 1):
+            steps.append(SplitStep(source=i, direction="down", ratio=1.0 / (n - i)))
+        return steps
+
+
+class ColumnsLayout(LayoutStrategy):
+    """``n`` side-by-side columns of equal width, boss leftmost."""
+
+    name = "columns"
+
+    def plan(self, n: int) -> List[SplitStep]:
+        if n < 1:
+            raise ValueError("need at least one pane")
+        # Peel one even column off the shrinking remainder each time: keeping
+        # 1/(n-k) of the current width leaves exactly one column on the left.
+        return [
+            SplitStep(source=k, direction="right", ratio=1.0 / (n - k))
+            for k in range(n - 1)
+        ]
+
+
+LAYOUTS = {s.name: s for s in (LeftStackLayout(), ColumnsLayout())}
+DEFAULT_LAYOUT = "left-stack"
+
+
+def get_layout(name: str) -> LayoutStrategy:
+    """Resolve a ``--layout`` name to its strategy, or reject it."""
+    try:
+        return LAYOUTS[name]
+    except KeyError:
+        raise typer.BadParameter(
+            f"unknown layout {name!r}; choose from {', '.join(LAYOUTS)}"
+        )
+
+
+# --- Pure argv builders (shared by the facade and by --dry-run previews) --
+def workspace_create_argv(cwd: str, label: str) -> List[str]:
+    return ["workspace", "create", "--cwd", cwd, "--label", label, "--no-focus"]
+
+
+def worktree_create_argv(repo: str, branch: str, base: str, label: str) -> List[str]:
+    return [
+        "worktree", "create", "--cwd", repo, "--branch", branch,
+        "--base", base, "--label", label, "--no-focus",
+    ]
+
+
+def pane_split_argv(pane: str, step: SplitStep, cwd: str) -> List[str]:
+    argv = ["pane", "split", pane, "--direction", step.direction]
+    if step.ratio is not None:
+        argv += ["--ratio", f"{step.ratio:.4f}"]
+    argv += ["--cwd", cwd, "--no-focus"]
+    return argv
+
+
+def pane_run_argv(pane: str, command: str) -> List[str]:
+    return ["pane", "run", pane, command]
+
+
+# --- Relaunch: how a pane re-invokes this CLI for one role ----------------
+def claude_team_invocation(
+    which: Optional[Callable[[str], Optional[str]]] = None,
+    package_root: Optional[str] = None,
+    env: Optional[Mapping[str, str]] = None,
+) -> List[str]:
+    """Resolve how to invoke this CLI *as a bare command in a fresh pane shell*.
+
+    The pane runs a plain login shell, so the invocation must resolve there — not
+    just in our own (possibly ``uv run``) environment. So a ``claude-team`` that
+    merely comes from the transient ``uv run`` venv we are in now does not count
+    as durably installed.
+
+    Prefer a durably-installed ``claude-team``; else ``uv run --project <clone>
+    claude-team`` (works in a bare shell as long as ``uv`` is on PATH — the way
+    the tool runs before it is installed); else this interpreter + module.
+    """
+    resolve = which or shutil.which  # resolve at call time so tests can patch it
+    environ = env if env is not None else os.environ
+    found = resolve("claude-team")
+    venv = environ.get("VIRTUAL_ENV")
+    in_current_env = bool(found) and (
+        (bool(venv) and found.startswith(venv)) or found.startswith(sys.prefix)
+    )
+    if found and not in_current_env:
+        return ["claude-team"]
+    if resolve("uv"):
+        root = package_root or str(Path(__file__).resolve().parents[1])
+        return ["uv", "run", "--project", root, "claude-team"]
+    return [sys.executable, "-m", "claude_team.cli"]
+
+
+def pane_launch_command(
+    invocation: List[str],
+    role: Role,
+    topic: str,
+    suffix: Optional[str],
+    prompt: Optional[str] = None,
+) -> str:
+    """The shell command sent into a pane to launch one role foreground there."""
+    argv = list(invocation) + [role_token(role), topic]
+    if suffix and suffix.strip():
+        argv += ["--suffix", suffix]
+    if prompt:
+        argv += ["--prompt", prompt]
+    argv.append("--fg")
+    return shlex.join(argv)
+
+
+# --- Facade over the `herdr` CLI subsystem -------------------------------
+HerdrRunner = Callable[[List[str]], "subprocess.CompletedProcess"]
+
+
+def default_herdr_runner(args: List[str]) -> "subprocess.CompletedProcess":
+    """Run ``herdr <args>`` and capture its output (the injectable subsystem)."""
+    return subprocess.run(["herdr", *args], capture_output=True, text=True)
+
+
+class HerdrError(RuntimeError):
+    """A ``herdr`` CLI call failed or returned an error payload."""
+
+
+class Herdr:
+    """Facade over the ``herdr`` CLI: semantic operations in, parsed data out.
+
+    The client (the ``space`` / ``worktree`` commands) never touches subprocess
+    plumbing or JSON shapes. A ``runner`` is injected so tests can drive the
+    facade with canned responses instead of a live herdr server.
+    """
+
+    def __init__(self, runner: Optional[HerdrRunner] = None) -> None:
+        # Resolve the module default at call time so tests can monkeypatch it.
+        self._run = runner or default_herdr_runner
+
+    def _call(self, args: List[str]) -> dict:
+        """Run one herdr command; return its ``.result`` payload or raise.
+
+        Some commands (notably ``pane run``) succeed with no output; an empty
+        stdout on a clean exit is treated as an empty result, not an error.
+        """
+        proc = self._run(args)
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout or "").strip()
+            raise HerdrError(
+                f"`herdr {shlex.join(args)}` failed (rc={proc.returncode}): {detail}"
+            )
+        if not (proc.stdout or "").strip():
+            return {}
+        try:
+            data = json.loads(proc.stdout)
+        except json.JSONDecodeError:
+            raise HerdrError(
+                f"`herdr {shlex.join(args)}`: non-JSON output: {proc.stdout[:200]!r}"
+            )
+        if isinstance(data, dict) and data.get("error"):
+            raise HerdrError(f"`herdr {shlex.join(args)}`: {data['error']}")
+        return data.get("result", {}) if isinstance(data, dict) else {}
+
+    def create_workspace(self, cwd: str, label: str) -> Tuple[str, str]:
+        """Create a workspace (one tab); return ``(workspace_id, root_pane_id)``."""
+        r = self._call(workspace_create_argv(cwd, label))
+        return r["workspace"]["workspace_id"], r["root_pane"]["pane_id"]
+
+    def create_worktree(
+        self, repo: str, branch: str, base: str, label: str
+    ) -> Tuple[str, str, str]:
+        """Create a git worktree + bound workspace; return
+        ``(workspace_id, root_pane_id, checkout_path)``."""
+        r = self._call(worktree_create_argv(repo, branch, base, label))
+        ws = r["workspace"]
+        checkout = (ws.get("worktree") or {}).get("checkout_path", "")
+        return ws["workspace_id"], r["root_pane"]["pane_id"], checkout
+
+    def split(self, pane: str, step: SplitStep, cwd: str) -> str:
+        """Split ``pane`` per ``step``; return the new pane's id."""
+        return self._call(pane_split_argv(pane, step, cwd))["pane"]["pane_id"]
+
+    def run_in_pane(self, pane: str, command: str) -> None:
+        """Type ``command`` + Enter into ``pane``'s shell."""
+        self._call(pane_run_argv(pane, command))
+
+    def agents_in_workspace(self, ws_id: str) -> List[dict]:
+        """Recognized agents currently living in ``ws_id``."""
+        agents = self._call(["agent", "list"]).get("agents", [])
+        return [a for a in agents if a.get("workspace_id") == ws_id]
+
+    def wait_for_output(self, pane: str, regex: str, timeout_ms: int) -> None:
+        """Best-effort wait for matching pane output; never fatal (boot probe)."""
+        try:
+            self._call(
+                ["pane", "wait-output", pane, "--regex", regex, "--timeout", str(timeout_ms)]
+            )
+        except HerdrError:
+            pass
+
+
+def herdr_available(which: Optional[Callable[[str], Optional[str]]] = None) -> bool:
+    resolve = which or shutil.which  # resolve at call time so tests can patch it
+    return resolve("herdr") is not None
+
+
+def require_herdr(env: Mapping[str, str]) -> None:
+    """Guard: real control needs a live Herdr session and the binary on PATH."""
+    if env.get("HERDR_ENV") != "1":
+        raise typer.BadParameter(
+            "not inside a Herdr session (HERDR_ENV != 1); open a herdr pane, "
+            "or pass --dry-run to preview."
+        )
+    if not herdr_available():
+        raise typer.BadParameter("herdr not found on PATH")
+
+
+# --- Director: split panes, launch a role in each ------------------------
+def place_team(
+    herdr: Herdr,
+    layout: LayoutStrategy,
+    root_pane: str,
+    cwd: str,
+    roles: List[Role],
+    topic: str,
+    suffix: Optional[str],
+    invocation: List[str],
+    prompts: Optional[Mapping[Role, str]] = None,
+) -> List[Tuple[Role, str]]:
+    """Grow ``root_pane`` into the layout, then launch one role per pane.
+
+    Roles arrive in canonical order (boss first), and pane 0 is the root, so the
+    boss is always launched first — the dev/qa "check in with boss" prompt lands
+    on a live session. ``prompts`` overrides a role's opening prompt by role.
+    """
+    prompts = prompts or {}
+    panes = [root_pane]
+    for step in layout.plan(len(roles)):
+        panes.append(herdr.split(panes[step.source], step, cwd))
+    placements = list(zip(roles, panes))
+    for role, pane in placements:
+        cmd = pane_launch_command(invocation, role, topic, suffix, prompts.get(role))
+        herdr.run_in_pane(pane, cmd)
+    return placements
+
+
+def preview_placement(
+    layout: LayoutStrategy,
+    roles: List[Role],
+    topic: str,
+    suffix: Optional[str],
+    invocation: List[str],
+    cwd: str,
+    prompts: Optional[Mapping[Role, str]] = None,
+) -> List[str]:
+    """Human-readable dry-run of the splits + per-pane launches (no pane ids yet)."""
+    prompts = prompts or {}
+    tokens = [role_token(r) for r in roles]
+    refs = [f"<{tokens[0]}>"]
+    lines = [f"# layout: {layout.name}, {len(roles)} pane(s)"]
+    for idx, step in enumerate(layout.plan(len(roles)), start=1):
+        lines.append("herdr " + " ".join(pane_split_argv(refs[step.source], step, cwd)))
+        refs.append(f"<{tokens[idx]}>")
+    lines.append("# per-pane launch (foreground):")
+    for role in roles:
+        cmd = pane_launch_command(invocation, role, topic, suffix, prompts.get(role))
+        lines.append(f"[{role_token(role)}] {cmd}")
+    return lines
+
+
+def report_team(
+    herdr: Herdr,
+    ws_id: str,
+    placements: List[Tuple[Role, str]],
+    wait: bool,
+    teardown: str,
+    extra: Optional[str] = None,
+) -> None:
+    """Print the created workspace, pane→role map, live status, and next steps."""
+    if wait and placements:
+        herdr.wait_for_output(placements[0][1], BOOT_REGEX, 20000)
+    statuses: dict = {}
+    if wait:
+        try:
+            statuses = {
+                a["pane_id"]: a.get("agent_status", "?")
+                for a in herdr.agents_in_workspace(ws_id)
+            }
+        except HerdrError:
+            statuses = {}
+
+    typer.echo(f"✓ workspace {ws_id}")
+    if extra:
+        typer.echo(f"  {extra}")
+    for role, pane in placements:
+        stag = f"  [{statuses[pane]}]" if pane in statuses else ""
+        typer.echo(f"  {role.label:9} {pane}{stag}")
+    typer.echo(f"  focus:    herdr workspace focus {ws_id}")
+    typer.echo(f"  teardown: {teardown}")
 
 
 # --- State detection for quickstart --------------------------------------
@@ -315,6 +701,13 @@ DryRunOpt = typer.Option(
     "--dry-run",
     help="Print the claude command that would run, then exit.",
 )
+PromptOpt = typer.Option(
+    None,
+    "--prompt",
+    "-p",
+    help="Opening prompt for the session (overrides the role default), e.g. a "
+    '"/resume_handoff <path>" slash command.',
+)
 
 
 @app.command()
@@ -322,10 +715,11 @@ def boss(
     topic: str = TopicArg,
     suffix: Optional[str] = SuffixOpt,
     background: Optional[bool] = BgOpt,
+    prompt: Optional[str] = PromptOpt,
     dry_run: bool = DryRunOpt,
 ) -> None:
-    """Launch the Boss agent (Fable, no opening prompt)."""
-    launch(BOSS, topic, suffix, background, dry_run)
+    """Launch the Boss agent (Fable; no opening prompt unless --prompt given)."""
+    launch(BOSS, topic, suffix, background, dry_run, prompt)
 
 
 @app.command()
@@ -333,10 +727,11 @@ def dev(
     topic: str = TopicArg,
     suffix: Optional[str] = SuffixOpt,
     background: Optional[bool] = BgOpt,
+    prompt: Optional[str] = PromptOpt,
     dry_run: bool = DryRunOpt,
 ) -> None:
     """Launch the Developer agent (Opus 4.8, opens by checking in with boss)."""
-    launch(DEVELOPER, topic, suffix, background, dry_run)
+    launch(DEVELOPER, topic, suffix, background, dry_run, prompt)
 
 
 @app.command()
@@ -344,10 +739,11 @@ def qa(
     topic: str = TopicArg,
     suffix: Optional[str] = SuffixOpt,
     background: Optional[bool] = BgOpt,
+    prompt: Optional[str] = PromptOpt,
     dry_run: bool = DryRunOpt,
 ) -> None:
     """Launch the QA agent (Opus 4.8, opens by checking in with boss)."""
-    launch(QA, topic, suffix, background, dry_run)
+    launch(QA, topic, suffix, background, dry_run, prompt)
 
 
 @app.command()
@@ -366,6 +762,138 @@ def team(
         LaunchPlan(role, topic, suffix, background=True) for role in parse_roles(roles)
     ]
     launch_team(plans, dry_run)
+
+
+# --- Herdr commands: a team laid out in panes ----------------------------
+RolesOpt = typer.Option(
+    "boss,dev,qa", "--roles", help="Comma-separated subset of the team, e.g. boss,qa."
+)
+LayoutOpt = typer.Option(
+    DEFAULT_LAYOUT, "--layout", help=f"Pane layout. Choices: {', '.join(LAYOUTS)}."
+)
+CwdOpt = typer.Option(None, "--cwd", help="Working dir for the panes (default: current dir).")
+LabelOpt = typer.Option(None, "--label", help="Workspace label (default: the topic / branch).")
+WaitOpt = typer.Option(
+    True, "--wait/--no-wait", help="Wait for the boss to boot, then report agent status."
+)
+BossPromptOpt = typer.Option(
+    None,
+    "--boss-prompt",
+    help="Opening prompt for the boss pane, e.g. a \"/resume_handoff <path>\" "
+    "slash command. dev/qa keep their 'check in with boss' prompt.",
+)
+
+
+def boss_prompts(selected: List[Role], boss_prompt: Optional[str]) -> dict:
+    """Build the per-role prompt overrides. Warn (non-fatal) if the boss was asked
+    for a prompt but is not in the selected roles."""
+    if not boss_prompt:
+        return {}
+    if BOSS not in selected:
+        typer.echo("warning: --boss-prompt given but 'boss' is not in --roles", err=True)
+        return {}
+    return {BOSS: boss_prompt}
+
+
+@app.command()
+def space(
+    topic: str = TopicArg,
+    roles: str = RolesOpt,
+    layout: str = LayoutOpt,
+    cwd: Optional[str] = CwdOpt,
+    label: Optional[str] = LabelOpt,
+    suffix: Optional[str] = SuffixOpt,
+    boss_prompt: Optional[str] = BossPromptOpt,
+    wait: bool = WaitOpt,
+    dry_run: bool = DryRunOpt,
+) -> None:
+    """Create a Herdr workspace (one tab) and launch a role per pane in it."""
+    selected = parse_roles(roles)
+    strategy = get_layout(layout)
+    work_cwd = cwd or os.getcwd()
+    ws_label = (label or topic).strip()
+    invocation = claude_team_invocation()
+    prompts = boss_prompts(selected, boss_prompt)
+
+    if dry_run:
+        typer.echo(shlex.join(["herdr", *workspace_create_argv(work_cwd, ws_label)]))
+        for line in preview_placement(strategy, selected, topic, suffix, invocation, work_cwd, prompts):
+            typer.echo(line)
+        raise typer.Exit()
+
+    require_herdr(os.environ)
+    herdr = Herdr()
+    try:
+        ws_id, root_pane = herdr.create_workspace(work_cwd, ws_label)
+        placements = place_team(
+            herdr, strategy, root_pane, work_cwd, selected, topic, suffix, invocation, prompts
+        )
+    except HerdrError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(1)
+    report_team(herdr, ws_id, placements, wait, teardown=f"herdr workspace close {ws_id}")
+
+
+@app.command()
+def worktree(
+    branch: str = typer.Argument(
+        ..., metavar="BRANCH", help="New branch / worktree name (e.g. jesse/chom-123-...)."
+    ),
+    repo: Optional[str] = typer.Option(
+        None, "--repo", help="Repo path to branch from (default: current dir)."
+    ),
+    base: str = typer.Option("origin/dev", "--base", help="Base ref for the new branch."),
+    topic: Optional[str] = typer.Option(
+        None, "--topic", help="Team topic / session-name stem (default: the branch name)."
+    ),
+    roles: str = RolesOpt,
+    layout: str = LayoutOpt,
+    label: Optional[str] = LabelOpt,
+    suffix: Optional[str] = SuffixOpt,
+    boss_prompt: Optional[str] = BossPromptOpt,
+    wait: bool = WaitOpt,
+    dry_run: bool = DryRunOpt,
+) -> None:
+    """Create a git worktree via Herdr and launch a role per pane on that branch."""
+    if not branch.strip():
+        raise typer.BadParameter("BRANCH must not be empty.")
+    selected = parse_roles(roles)
+    strategy = get_layout(layout)
+    repo_path = repo or os.getcwd()
+    team_topic = (topic or branch).strip()
+    ws_label = (label or branch).strip()
+    invocation = claude_team_invocation()
+    prompts = boss_prompts(selected, boss_prompt)
+
+    if dry_run:
+        typer.echo(
+            shlex.join(["herdr", *worktree_create_argv(repo_path, branch, base, ws_label)])
+        )
+        for line in preview_placement(strategy, selected, team_topic, suffix, invocation, "<checkout>", prompts):
+            typer.echo(line)
+        raise typer.Exit()
+
+    require_herdr(os.environ)
+    herdr = Herdr()
+    try:
+        ws_id, root_pane, checkout = herdr.create_worktree(repo_path, branch, base, ws_label)
+        placements = place_team(
+            herdr, strategy, root_pane, checkout or repo_path, selected, team_topic, suffix, invocation, prompts
+        )
+    except HerdrError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(1)
+    report_team(
+        herdr,
+        ws_id,
+        placements,
+        wait,
+        teardown=(
+            f"herdr worktree remove --workspace {ws_id}   "
+            f"# then: git -C {repo_path} branch -D {branch}"
+        ),
+        extra=f"branch {branch} @ {base}  ->  {checkout or '(worktree)'}",
+    )
 
 
 def render_quickstart(state: dict) -> str:
