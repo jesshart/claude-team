@@ -92,6 +92,27 @@ claude-team space PROJ-123 --cwd ~/code/app   # working dir for the panes
 claude-team space PROJ-123 --dry-run          # preview the herdr commands, launch nothing
 ```
 
+**Per-role opening prompts.** By default the boss opens with no prompt and dev/qa
+open with `"Check in with boss"`. Override any role with `--boss-prompt` /
+`--dev-prompt` / `--qa-prompt` — e.g. resume a whole team where each role reloads
+its own handoff:
+
+```bash
+claude-team space CHOM-893 --suffix "Handoff Day 2" \
+  --boss-prompt '/resume_handoff boss.md' \
+  --dev-prompt  '/resume_handoff dev.md' \
+  --qa-prompt   '/resume_handoff qa.md'
+```
+
+Omit a flag and that role keeps its default. A prompt for a role not in `--roles`
+is a no-op with a warning. The same three flags work on `worktree` below.
+
+Dev and qa always check in with the boss, even with a custom prompt. Since a
+custom prompt is usually a slash command (and Claude Code won't let extra text be
+appended to one), the check-in is carried as a `--append-system-prompt`
+instruction rather than tacked onto the prompt — the slash command stays the
+clean opening message.
+
 Start the team **on a fresh git worktree** in one step — it creates the branch,
 the checkout, and the workspace, then launches the team on that branch:
 
@@ -100,6 +121,21 @@ claude-team worktree jesse/chom-123-thing --repo ~/code/app    # branch off orig
 claude-team worktree my-spike --base main --topic "spike idea"  # custom base + topic
 claude-team worktree my-spike --dry-run                         # preview, create nothing
 ```
+
+**Open an existing worktree** with `--open` (uses `herdr worktree open`), so the
+team nests under that repo's tree in Herdr instead of floating in a standalone
+space — the difference between a *worktree-workspace* and a bare `space`:
+
+```bash
+claude-team worktree jesse/chom-123-thing --repo ~/code/app --open   # reuse the existing checkout
+```
+
+A git worktree maps to a single Herdr workspace, so `--open` on a worktree that
+already has a team reuses that workspace; the command **refuses** to add a second
+team into a workspace that already holds agents unless you pass `--force`. With
+`--open`, `--base` and `--label` are ignored (the worktree keeps its own label).
+Because it opened a pre-existing worktree, teardown just closes the workspace
+(`herdr workspace close <ws>`) — it never removes the checkout or deletes the branch.
 
 Both print the workspace id, the pane→role map with live status, and the exact
 teardown command:
@@ -247,6 +283,10 @@ launches foreground or background, and a live snapshot of running team sessions
 | `boss`  | `Boss: <topic>`      | `fable`          | (none)              |
 | `dev`   | `Developer: <topic>` | `claude-opus-4-8` | `Check in with boss` |
 | `qa`    | `QA: <topic>`        | `claude-opus-4-8` | `Check in with boss` |
+
+Opening prompts are overridable: the single-role commands take `--prompt`, and
+the paned `space` / `worktree` commands take `--boss-prompt` / `--dev-prompt` /
+`--qa-prompt`.
 
 ## Development
 

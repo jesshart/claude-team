@@ -92,11 +92,25 @@ def build_command(
     ``prompt`` overrides the role's default opening prompt when given — e.g. a
     ``/resume_handoff …`` slash command for the boss, which otherwise opens with
     no prompt. Pass ``None`` to keep the role default.
+
+    Every non-boss role must check in with the boss. With no custom prompt that
+    check-in *is* their opening prompt. With a custom prompt it cannot simply be
+    appended to the prompt text: the custom prompt is usually a slash command,
+    and Claude Code folds any trailing text into the command's ``$ARGUMENTS`` and
+    blocks a command containing a newline. So the custom prompt stays the clean
+    opening message and the check-in rides along as an ``--append-system-prompt``
+    standing instruction instead (skipped if the prompt already checks in).
     """
     cmd = ["claude"]
     if background:
         cmd.append("--bg")
     cmd += ["--name", build_name(role, topic, suffix), "--model", role.model]
+    if (
+        prompt is not None
+        and role != BOSS
+        and CHECK_IN_PROMPT.lower() not in prompt.lower()
+    ):
+        cmd += ["--append-system-prompt", f"{CHECK_IN_PROMPT}."]
     effective = prompt if prompt is not None else role.prompt
     if effective:
         cmd.append(effective)
@@ -368,6 +382,15 @@ def worktree_create_argv(repo: str, branch: str, base: str, label: str) -> List[
     ]
 
 
+def worktree_open_argv(repo: str, branch: str) -> List[str]:
+    # herdr resolves the worktree from the repo PARENT, selecting the linked
+    # checkout by --branch. Passing the checkout itself as --cwd/--path errors, so
+    # --cwd must be the repo root. No --base (the branch already exists) and no
+    # --label: opening an already-open worktree with a --label *renames* its
+    # workspace, so we never pass one — the worktree keeps its natural label.
+    return ["worktree", "open", "--cwd", repo, "--branch", branch, "--no-focus"]
+
+
 def pane_split_argv(pane: str, step: SplitStep, cwd: str) -> List[str]:
     argv = ["pane", "split", pane, "--direction", step.direction]
     if step.ratio is not None:
@@ -489,6 +512,19 @@ class Herdr:
         """Create a git worktree + bound workspace; return
         ``(workspace_id, root_pane_id, checkout_path)``."""
         r = self._call(worktree_create_argv(repo, branch, base, label))
+        ws = r["workspace"]
+        checkout = (ws.get("worktree") or {}).get("checkout_path", "")
+        return ws["workspace_id"], r["root_pane"]["pane_id"], checkout
+
+    def open_worktree(self, repo: str, branch: str) -> Tuple[str, str, str]:
+        """Open an EXISTING git worktree's bound workspace; return
+        ``(workspace_id, root_pane_id, checkout_path)``.
+
+        A worktree maps to a single workspace: opening one already open returns
+        that same workspace (its id + current root pane), it does not make a
+        second. Callers that mean to *populate* a fresh team must first check the
+        workspace is empty (see ``agents_in_workspace``)."""
+        r = self._call(worktree_open_argv(repo, branch))
         ws = r["workspace"]
         checkout = (ws.get("worktree") or {}).get("checkout_path", "")
         return ws["workspace_id"], r["root_pane"]["pane_id"], checkout
@@ -780,19 +816,48 @@ BossPromptOpt = typer.Option(
     None,
     "--boss-prompt",
     help="Opening prompt for the boss pane, e.g. a \"/resume_handoff <path>\" "
-    "slash command. dev/qa keep their 'check in with boss' prompt.",
+    "slash command (the boss otherwise opens with no prompt).",
+)
+DevPromptOpt = typer.Option(
+    None,
+    "--dev-prompt",
+    help="Opening prompt for the dev pane, overriding its 'check in with boss' "
+    "default (e.g. a \"/resume_handoff <path>\" slash command).",
+)
+QaPromptOpt = typer.Option(
+    None,
+    "--qa-prompt",
+    help="Opening prompt for the qa pane, overriding its 'check in with boss' "
+    "default (e.g. a \"/resume_handoff <path>\" slash command).",
 )
 
 
-def boss_prompts(selected: List[Role], boss_prompt: Optional[str]) -> dict:
-    """Build the per-role prompt overrides. Warn (non-fatal) if the boss was asked
-    for a prompt but is not in the selected roles."""
-    if not boss_prompt:
-        return {}
-    if BOSS not in selected:
-        typer.echo("warning: --boss-prompt given but 'boss' is not in --roles", err=True)
-        return {}
-    return {BOSS: boss_prompt}
+def role_prompts(
+    selected: List[Role],
+    boss_prompt: Optional[str] = None,
+    dev_prompt: Optional[str] = None,
+    qa_prompt: Optional[str] = None,
+) -> dict:
+    """Build the per-role opening-prompt overrides for a paned team.
+
+    Each ``*_prompt`` overrides that role's default opening prompt (boss: none;
+    dev/qa: "Check in with boss"). A prompt given for a role that is not in
+    ``selected`` is a no-op with a non-fatal warning, so a ``--roles`` typo never
+    silently swallows a prompt.
+    """
+    prompts: dict = {}
+    for role, prompt in ((BOSS, boss_prompt), (DEVELOPER, dev_prompt), (QA, qa_prompt)):
+        if not prompt:
+            continue
+        if role not in selected:
+            token = role_token(role)
+            typer.echo(
+                f"warning: --{token}-prompt given but '{token}' is not in --roles",
+                err=True,
+            )
+            continue
+        prompts[role] = prompt
+    return prompts
 
 
 @app.command()
@@ -804,6 +869,8 @@ def space(
     label: Optional[str] = LabelOpt,
     suffix: Optional[str] = SuffixOpt,
     boss_prompt: Optional[str] = BossPromptOpt,
+    dev_prompt: Optional[str] = DevPromptOpt,
+    qa_prompt: Optional[str] = QaPromptOpt,
     wait: bool = WaitOpt,
     dry_run: bool = DryRunOpt,
 ) -> None:
@@ -813,7 +880,7 @@ def space(
     work_cwd = cwd or os.getcwd()
     ws_label = (label or topic).strip()
     invocation = claude_team_invocation()
-    prompts = boss_prompts(selected, boss_prompt)
+    prompts = role_prompts(selected, boss_prompt, dev_prompt, qa_prompt)
 
     if dry_run:
         typer.echo(shlex.join(["herdr", *workspace_create_argv(work_cwd, ws_label)]))
@@ -842,7 +909,20 @@ def worktree(
     repo: Optional[str] = typer.Option(
         None, "--repo", help="Repo path to branch from (default: current dir)."
     ),
-    base: str = typer.Option("origin/dev", "--base", help="Base ref for the new branch."),
+    base: str = typer.Option("origin/dev", "--base", help="Base ref for the new branch (ignored with --open)."),
+    open_existing: bool = typer.Option(
+        False,
+        "--open",
+        help="Open an EXISTING worktree for BRANCH (herdr worktree open) and nest "
+        "the team under it, instead of creating a new branch. --base and --label "
+        "are ignored (the worktree keeps its own label).",
+    ),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help="With --open, launch even if the worktree's workspace already holds "
+        "agents (its team). Default: refuse, to avoid clobbering a running team.",
+    ),
     topic: Optional[str] = typer.Option(
         None, "--topic", help="Team topic / session-name stem (default: the branch name)."
     ),
@@ -851,10 +931,17 @@ def worktree(
     label: Optional[str] = LabelOpt,
     suffix: Optional[str] = SuffixOpt,
     boss_prompt: Optional[str] = BossPromptOpt,
+    dev_prompt: Optional[str] = DevPromptOpt,
+    qa_prompt: Optional[str] = QaPromptOpt,
     wait: bool = WaitOpt,
     dry_run: bool = DryRunOpt,
 ) -> None:
-    """Create a git worktree via Herdr and launch a role per pane on that branch."""
+    """Create (or, with --open, reuse an existing) git worktree and launch a team on it.
+
+    A git worktree maps to a single Herdr workspace, so --open on a worktree that
+    already has a team reuses that workspace; the guard refuses to add a second
+    team into it unless --force is given.
+    """
     if not branch.strip():
         raise typer.BadParameter("BRANCH must not be empty.")
     selected = parse_roles(roles)
@@ -863,12 +950,15 @@ def worktree(
     team_topic = (topic or branch).strip()
     ws_label = (label or branch).strip()
     invocation = claude_team_invocation()
-    prompts = boss_prompts(selected, boss_prompt)
+    prompts = role_prompts(selected, boss_prompt, dev_prompt, qa_prompt)
 
+    create_argv = (
+        worktree_open_argv(repo_path, branch)
+        if open_existing
+        else worktree_create_argv(repo_path, branch, base, ws_label)
+    )
     if dry_run:
-        typer.echo(
-            shlex.join(["herdr", *worktree_create_argv(repo_path, branch, base, ws_label)])
-        )
+        typer.echo(shlex.join(["herdr", *create_argv]))
         for line in preview_placement(strategy, selected, team_topic, suffix, invocation, "<checkout>", prompts):
             typer.echo(line)
         raise typer.Exit()
@@ -876,24 +966,39 @@ def worktree(
     require_herdr(os.environ)
     herdr = Herdr()
     try:
-        ws_id, root_pane, checkout = herdr.create_worktree(repo_path, branch, base, ws_label)
+        if open_existing:
+            ws_id, root_pane, checkout = herdr.open_worktree(repo_path, branch)
+            if not force:
+                existing = herdr.agents_in_workspace(ws_id)
+                if existing:
+                    typer.echo(
+                        f"error: worktree {branch} is already open in workspace {ws_id} "
+                        f"with {len(existing)} agent(s). A worktree maps to one workspace, "
+                        f"so this would add a team into the running one. Close it first "
+                        f"(herdr workspace close {ws_id}) or pass --force.",
+                        err=True,
+                    )
+                    raise typer.Exit(1)
+        else:
+            ws_id, root_pane, checkout = herdr.create_worktree(repo_path, branch, base, ws_label)
         placements = place_team(
             herdr, strategy, root_pane, checkout or repo_path, selected, team_topic, suffix, invocation, prompts
         )
     except HerdrError as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(1)
-    report_team(
-        herdr,
-        ws_id,
-        placements,
-        wait,
-        teardown=(
+    if open_existing:
+        # We opened a pre-existing worktree; teardown only closes the workspace,
+        # it must not remove the checkout or delete the branch.
+        teardown = f"herdr workspace close {ws_id}"
+        extra = f"opened existing worktree {branch}  ->  {checkout or '(worktree)'}"
+    else:
+        teardown = (
             f"herdr worktree remove --workspace {ws_id}   "
             f"# then: git -C {repo_path} branch -D {branch}"
-        ),
-        extra=f"branch {branch} @ {base}  ->  {checkout or '(worktree)'}",
-    )
+        )
+        extra = f"branch {branch} @ {base}  ->  {checkout or '(worktree)'}"
+    report_team(herdr, ws_id, placements, wait, teardown=teardown, extra=extra)
 
 
 def render_quickstart(state: dict) -> str:
@@ -961,6 +1066,21 @@ def render_quickstart(state: dict) -> str:
         "claude-team dev  PROJ-123 --bg",
         "claude-team qa   PROJ-123 --bg",
         "```",
+        "",
+        "In a Herdr pane, lay the team out in panes and give each role its own"
+        " opening prompt (omit a flag to keep that role's default — boss: none,"
+        ' dev/qa: "Check in with boss"):',
+        "```",
+        "claude-team space PROJ-123 \\",
+        "  --boss-prompt '/resume_handoff boss.md' \\",
+        "  --dev-prompt  '/resume_handoff dev.md' \\",
+        "  --qa-prompt   '/resume_handoff qa.md'",
+        "# fresh git worktree:    claude-team worktree <branch> ...",
+        "# existing worktree:     claude-team worktree <branch> --repo <root> --open  (nests under the repo)",
+        "```",
+        "",
+        "dev/qa still check in with the boss even with a custom prompt: the check-in"
+        " rides along as --append-system-prompt so a leading slash command stays intact.",
         "",
         "Find and reach sessions:",
         "```",
