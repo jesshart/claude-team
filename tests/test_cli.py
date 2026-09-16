@@ -23,7 +23,6 @@ from claude_team.cli import (
     QA,
     SplitStep,
     app,
-    boss_prompts,
     build_command,
     build_name,
     claude_team_invocation,
@@ -37,9 +36,11 @@ from claude_team.cli import (
     pane_split_argv,
     parse_roles,
     place_team,
+    role_prompts,
     role_token,
     workspace_create_argv,
     worktree_create_argv,
+    worktree_open_argv,
 )
 
 runner = CliRunner()
@@ -67,6 +68,9 @@ class FakeHerdrRunner:
         if head == ["worktree", "create"]:
             return {"workspace": {"workspace_id": "w2", "worktree": {"checkout_path": "/co"}},
                     "root_pane": {"pane_id": "w2:p1"}}
+        if head == ["worktree", "open"]:
+            return {"workspace": {"workspace_id": "w3", "worktree": {"checkout_path": "/open"}},
+                    "root_pane": {"pane_id": "w3:p1"}}
         if head == ["pane", "split"]:
             self._pane_seq += 1
             return {"pane": {"pane_id": f"w1:p{self._pane_seq}"}}
@@ -456,6 +460,16 @@ def test_quickstart_guide_mentions_roles_and_attach(monkeypatch):
     assert "Check in with boss" in result.stdout
 
 
+def test_quickstart_guide_surfaces_per_role_prompt_flags(monkeypatch):
+    # Whatever the tool accepts should be discoverable in the quickstart guide.
+    monkeypatch.setattr(cli.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(cli, "fetch_agents", lambda: [])
+    result = runner.invoke(app, ["quickstart"])
+    assert result.exit_code == 0
+    assert "--dev-prompt" in result.stdout
+    assert "--qa-prompt" in result.stdout
+
+
 # --- role_token ----------------------------------------------------------
 def test_role_token_maps_each_role_to_its_subcommand():
     assert role_token(BOSS) == "boss"
@@ -519,6 +533,14 @@ def test_worktree_create_argv():
     assert worktree_create_argv("/repo", "br", "origin/dev", "br") == [
         "worktree", "create", "--cwd", "/repo", "--branch", "br",
         "--base", "origin/dev", "--label", "br", "--no-focus",
+    ]
+
+
+def test_worktree_open_argv():
+    # opens an existing worktree: no --base and no --label (a --label would rename
+    # an already-open workspace), resolves by --branch from the repo root
+    assert worktree_open_argv("/repo", "br") == [
+        "worktree", "open", "--cwd", "/repo", "--branch", "br", "--no-focus",
     ]
 
 
@@ -591,6 +613,13 @@ def test_herdr_create_workspace_parses_ids():
 def test_herdr_create_worktree_returns_checkout():
     ws, pane, checkout = Herdr(FakeHerdrRunner()).create_worktree("/r", "b", "origin/dev", "b")
     assert (ws, pane, checkout) == ("w2", "w2:p1", "/co")
+
+
+def test_herdr_open_worktree_returns_checkout():
+    fake = FakeHerdrRunner()
+    ws, pane, checkout = Herdr(fake).open_worktree("/r", "b")
+    assert (ws, pane, checkout) == ("w3", "w3:p1", "/open")
+    assert fake.calls[0] == worktree_open_argv("/r", "b")
 
 
 def test_herdr_split_returns_new_pane_id():
@@ -694,6 +723,16 @@ def test_worktree_dry_run_previews_worktree_create(installed_ct):
     assert "[boss] claude-team boss my-branch --fg" in result.stdout
 
 
+def test_worktree_open_dry_run_previews_worktree_open(installed_ct):
+    result = runner.invoke(
+        app, ["worktree", "jesse/chom-893-resume", "--repo", "/repo", "--open", "--dry-run"]
+    )
+    assert result.exit_code == 0
+    assert "herdr worktree open --cwd /repo --branch jesse/chom-893-resume" in result.stdout
+    assert "--base" not in result.stdout  # open reuses an existing branch
+    assert "[boss] claude-team boss jesse/chom-893-resume --fg" in result.stdout
+
+
 def test_space_requires_herdr_env_when_not_dry_run(installed_ct, monkeypatch):
     monkeypatch.delenv("HERDR_ENV", raising=False)
     # Must never actually talk to herdr when the guard fails.
@@ -718,20 +757,99 @@ def test_space_real_run_reports_workspace_and_panes(installed_ct, monkeypatch):
     assert fake.pane_runs()[0] == ("w1:p1", "claude-team boss DEMO --fg")
 
 
-# --- prompt overrides: boss --prompt / space|worktree --boss-prompt -------
+def test_worktree_open_real_run_reports_and_uses_workspace_teardown(installed_ct, monkeypatch):
+    fake = FakeHerdrRunner()
+    monkeypatch.setenv("HERDR_ENV", "1")
+    monkeypatch.setattr(cli, "default_herdr_runner", fake)
+    monkeypatch.setattr(cli, "herdr_available", lambda which=None: True)
+
+    result = runner.invoke(
+        app, ["worktree", "jesse/chom-893-resume", "--repo", "/r", "--open", "--no-wait"]
+    )
+    assert result.exit_code == 0, result.output
+    assert "✓ workspace w3" in result.stdout
+    assert "opened existing worktree jesse/chom-893-resume" in result.stdout
+    # teardown closes the workspace only — never removes the pre-existing worktree/branch
+    assert "teardown: herdr workspace close w3" in result.stdout
+    assert "worktree remove" not in result.stdout
+    # panes launched in the opened worktree's checkout
+    assert fake.pane_runs()[0] == ("w3:p1", "claude-team boss jesse/chom-893-resume --fg")
+
+
+def test_worktree_open_refuses_when_workspace_already_has_agents(installed_ct, monkeypatch):
+    class OccupiedRunner(FakeHerdrRunner):
+        def _result(self, args):
+            if args[:2] == ["agent", "list"]:
+                return {"agents": [{"pane_id": "w3:p1", "workspace_id": "w3"}]}
+            return super()._result(args)
+
+    fake = OccupiedRunner()
+    monkeypatch.setenv("HERDR_ENV", "1")
+    monkeypatch.setattr(cli, "default_herdr_runner", fake)
+    monkeypatch.setattr(cli, "herdr_available", lambda which=None: True)
+
+    result = runner.invoke(app, ["worktree", "br", "--repo", "/r", "--open", "--no-wait"])
+    assert result.exit_code == 1
+    assert "already open in workspace w3" in result.output
+    assert "--force" in result.output
+    # guard fires before any pane is launched
+    assert not [c for c in fake.calls if c[:2] == ["pane", "split"]]
+    assert not fake.pane_runs()
+
+
+def test_worktree_open_force_launches_into_occupied_workspace(installed_ct, monkeypatch):
+    class OccupiedRunner(FakeHerdrRunner):
+        def _result(self, args):
+            if args[:2] == ["agent", "list"]:
+                return {"agents": [{"pane_id": "w3:p1", "workspace_id": "w3"}]}
+            return super()._result(args)
+
+    fake = OccupiedRunner()
+    monkeypatch.setenv("HERDR_ENV", "1")
+    monkeypatch.setattr(cli, "default_herdr_runner", fake)
+    monkeypatch.setattr(cli, "herdr_available", lambda which=None: True)
+
+    result = runner.invoke(
+        app, ["worktree", "br", "--repo", "/r", "--open", "--force", "--no-wait"]
+    )
+    assert result.exit_code == 0, result.output
+    assert fake.pane_runs()  # --force bypasses the guard and launches
+
+
+# --- prompt overrides: boss --prompt / space|worktree per-role prompts ----
 def test_build_command_prompt_overrides_role_default():
-    # boss has no default prompt; --prompt supplies one
+    # boss has no default prompt; --prompt supplies one, and boss never checks in
     assert build_command(BOSS, "T", None, background=False, prompt="/resume x") == [
         "claude", "--name", "Boss: T", "--model", "fable", "/resume x",
     ]
-    # dev's "Check in with boss" default is overridden
+    # dev's custom prompt becomes the clean opening message; the check-in rides
+    # along as a system-prompt instruction rather than replacing the prompt.
     cmd = build_command(DEVELOPER, "T", None, background=False, prompt="do this")
-    assert cmd[-1] == "do this" and "Check in with boss" not in cmd
+    assert cmd[-1] == "do this"
+    assert cmd[cmd.index("--append-system-prompt") + 1] == "Check in with boss."
 
 
 def test_build_command_no_prompt_keeps_role_default():
     cmd = build_command(DEVELOPER, "T", None, background=False)
     assert cmd[-1] == "Check in with boss"
+    assert "--append-system-prompt" not in cmd  # check-in is the opening prompt itself
+
+
+def test_build_command_boss_custom_prompt_has_no_checkin():
+    cmd = build_command(BOSS, "T", None, background=False, prompt="/resume x")
+    assert "--append-system-prompt" not in cmd
+
+
+def test_build_command_non_boss_custom_prompt_carries_checkin_as_system_prompt():
+    for role in (DEVELOPER, QA):
+        cmd = build_command(role, "T", None, background=False, prompt="/resume_handoff h.md")
+        assert cmd[-1] == "/resume_handoff h.md"  # slash command stays clean & leading
+        assert cmd[cmd.index("--append-system-prompt") + 1] == "Check in with boss."
+
+
+def test_build_command_non_boss_prompt_that_already_checks_in_is_not_doubled():
+    cmd = build_command(DEVELOPER, "T", None, background=False, prompt="Check in with boss, then X")
+    assert "--append-system-prompt" not in cmd
 
 
 def test_launch_plan_carries_prompt_into_argv():
@@ -744,17 +862,28 @@ def test_pane_launch_command_includes_prompt():
     assert cmd == "claude-team boss T --prompt '/resume_handoff a b.md' --fg"
 
 
-def test_boss_prompts_maps_boss_when_selected():
-    assert boss_prompts([BOSS, DEVELOPER, QA], "/resume x") == {BOSS: "/resume x"}
+def test_role_prompts_maps_each_role_when_selected():
+    assert role_prompts(
+        [BOSS, DEVELOPER, QA],
+        boss_prompt="/b",
+        dev_prompt="/d",
+        qa_prompt="/q",
+    ) == {BOSS: "/b", DEVELOPER: "/d", QA: "/q"}
 
 
-def test_boss_prompts_empty_without_prompt():
-    assert boss_prompts([BOSS], None) == {}
+def test_role_prompts_empty_without_any_prompt():
+    assert role_prompts([BOSS, DEVELOPER, QA]) == {}
 
 
-def test_boss_prompts_warns_when_boss_not_selected(capsys):
-    assert boss_prompts([DEVELOPER, QA], "/resume x") == {}
-    assert "boss" in capsys.readouterr().err.lower()
+def test_role_prompts_partial_leaves_others_at_default():
+    # only dev overridden; boss/qa keep their role defaults (absent from the map)
+    assert role_prompts([BOSS, DEVELOPER, QA], dev_prompt="/d") == {DEVELOPER: "/d"}
+
+
+def test_role_prompts_warns_per_role_when_not_selected(capsys):
+    assert role_prompts([DEVELOPER], boss_prompt="/b", qa_prompt="/q") == {}
+    err = capsys.readouterr().err.lower()
+    assert "--boss-prompt" in err and "--qa-prompt" in err
 
 
 def test_place_team_applies_boss_prompt_only_to_boss():
@@ -772,6 +901,15 @@ def test_boss_prompt_cli_dry_run(terminal_env):
     result = runner.invoke(app, ["boss", "T", "--prompt", "/resume_handoff h.md", "--dry-run"])
     assert result.exit_code == 0
     assert result.stdout.strip() == "claude --name 'Boss: T' --model fable '/resume_handoff h.md'"
+
+
+def test_dev_prompt_cli_dry_run_carries_checkin_system_prompt(terminal_env):
+    result = runner.invoke(app, ["dev", "T", "--prompt", "/resume_handoff h.md", "--dry-run"])
+    assert result.exit_code == 0
+    assert result.stdout.strip() == (
+        "claude --name 'Developer: T' --model claude-opus-4-8 "
+        "--append-system-prompt 'Check in with boss.' '/resume_handoff h.md'"
+    )
 
 
 def test_space_boss_prompt_dry_run(installed_ct):
@@ -799,4 +937,39 @@ def test_space_boss_prompt_ignored_when_boss_not_in_roles(installed_ct):
     )
     assert result.exit_code == 0
     assert "--prompt" not in result.stdout          # not applied
+    assert "warning" in result.output.lower()       # but warned (stderr)
+
+
+def test_space_per_role_prompts_dry_run(installed_ct):
+    result = runner.invoke(
+        app,
+        [
+            "space", "T", "--roles", "boss,dev,qa",
+            "--boss-prompt", "/resume boss.md",
+            "--dev-prompt", "/resume dev.md",
+            "--qa-prompt", "/resume qa.md",
+            "--dry-run",
+        ],
+    )
+    assert result.exit_code == 0
+    assert "[boss] claude-team boss T --prompt '/resume boss.md' --fg" in result.stdout
+    assert "[dev] claude-team dev T --prompt '/resume dev.md' --fg" in result.stdout
+    assert "[qa] claude-team qa T --prompt '/resume qa.md' --fg" in result.stdout
+
+
+def test_worktree_dev_prompt_dry_run(installed_ct):
+    result = runner.invoke(
+        app,
+        ["worktree", "br", "--repo", "/r", "--roles", "dev", "--dev-prompt", "/resume dev.md", "--dry-run"],
+    )
+    assert result.exit_code == 0
+    assert "[dev] claude-team dev br --prompt '/resume dev.md' --fg" in result.stdout
+
+
+def test_space_dev_prompt_ignored_when_dev_not_in_roles(installed_ct):
+    result = runner.invoke(
+        app, ["space", "T", "--roles", "boss,qa", "--dev-prompt", "/x", "--dry-run"]
+    )
+    assert result.exit_code == 0
+    assert "--prompt" not in result.stdout          # not applied to any pane
     assert "warning" in result.output.lower()       # but warned (stderr)
