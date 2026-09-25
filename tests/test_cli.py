@@ -19,7 +19,7 @@ from claude_team.cli import (
     HerdrError,
     LaunchPlan,
     LeftStackLayout,
-    OPUS_48,
+    OPUS_55,
     QA,
     SplitStep,
     app,
@@ -107,8 +107,8 @@ def test_build_name_custom_topic():
 # --- role definitions ----------------------------------------------------
 def test_role_models_and_prompts():
     assert BOSS.model == FABLE and BOSS.prompt is None
-    assert DEVELOPER.model == OPUS_48 and DEVELOPER.prompt == CHECK_IN_PROMPT
-    assert QA.model == OPUS_48 and QA.prompt == CHECK_IN_PROMPT
+    assert DEVELOPER.model == OPUS_55 and DEVELOPER.prompt == CHECK_IN_PROMPT
+    assert QA.model == OPUS_55 and QA.prompt == CHECK_IN_PROMPT
 
 
 # --- decide_background ---------------------------------------------------
@@ -149,7 +149,7 @@ def test_build_command_dev_appends_prompt():
         "--name",
         "Developer: PROJ-123 Handoff 1",
         "--model",
-        "claude-opus-4-8",
+        "claude-opus-5-5",
         "Check in with boss",
     ]
 
@@ -199,7 +199,7 @@ def test_dry_run_qa_with_prompt(terminal_env):
     result = runner.invoke(app, ["qa", "PROJ-123", "--dry-run"])
     assert result.exit_code == 0
     assert result.stdout.strip() == (
-        "claude --name 'QA: PROJ-123' --model claude-opus-4-8 'Check in with boss'"
+        "claude --name 'QA: PROJ-123' --model claude-opus-5-5 'Check in with boss'"
     )
 
 
@@ -261,12 +261,12 @@ def test_launch_plan_is_inert_and_pure():
         "--name",
         "Developer: PROJ-123 Handoff 1",
         "--model",
-        "claude-opus-4-8",
+        "claude-opus-5-5",
         "Check in with boss",
     ]
     assert plan.preview() == (
         "claude --bg --name 'Developer: PROJ-123 Handoff 1' "
-        "--model claude-opus-4-8 'Check in with boss'"
+        "--model claude-opus-5-5 'Check in with boss'"
     )
 
 
@@ -379,7 +379,7 @@ def test_foreground_launch_execs_expected_argv(terminal_env, monkeypatch):
         "--name",
         "Developer: PROJ-123",
         "--model",
-        "claude-opus-4-8",
+        "claude-opus-5-5",
         "Check in with boss",
     ]
 
@@ -588,18 +588,20 @@ def test_invocation_last_resort_is_this_interpreter_and_module():
 # --- pane_launch_command -------------------------------------------------
 def test_pane_launch_command_appends_fg_and_role_token():
     cmd = pane_launch_command(["claude-team"], DEVELOPER, "PROJ-1", None)
-    assert cmd == "claude-team dev PROJ-1 --fg"
+    assert cmd == "claude-team dev PROJ-1 --model claude-opus-5-5 --fg"
 
 
 def test_pane_launch_command_includes_suffix():
     cmd = pane_launch_command(["claude-team"], QA, "PROJ-1", "Handoff 2")
-    assert cmd == "claude-team qa PROJ-1 --suffix 'Handoff 2' --fg"
+    assert cmd == "claude-team qa PROJ-1 --suffix 'Handoff 2' --model claude-opus-5-5 --fg"
 
 
 def test_pane_launch_command_quotes_hostile_topic_safely():
     cmd = pane_launch_command(["ct"], BOSS, "a b | c && rm -rf ~", None)
     # round-trips through shlex, so the whole topic is a single inert token
-    assert cli.shlex.split(cmd) == ["ct", "boss", "a b | c && rm -rf ~", "--fg"]
+    assert cli.shlex.split(cmd) == [
+        "ct", "boss", "a b | c && rm -rf ~", "--model", "fable", "--fg",
+    ]
 
 
 # --- Facade: Herdr -------------------------------------------------------
@@ -672,9 +674,9 @@ def test_place_team_splits_then_launches_boss_first():
     assert placements == [(BOSS, "w1:p1"), (DEVELOPER, "w1:p2"), (QA, "w1:p3")]
     # each role launched foreground in its pane, boss first
     assert fake.pane_runs() == [
-        ("w1:p1", "claude-team boss TOPIC --fg"),
-        ("w1:p2", "claude-team dev TOPIC --fg"),
-        ("w1:p3", "claude-team qa TOPIC --fg"),
+        ("w1:p1", "claude-team boss TOPIC --model fable --fg"),
+        ("w1:p2", "claude-team dev TOPIC --model claude-opus-5-5 --fg"),
+        ("w1:p3", "claude-team qa TOPIC --model claude-opus-5-5 --fg"),
     ]
 
 
@@ -682,7 +684,7 @@ def test_place_team_single_role_no_splits():
     fake = FakeHerdrRunner()
     place_team(Herdr(fake), LeftStackLayout(), "w1:p1", "/x", [BOSS], "T", None, ["ct"])
     assert not [c for c in fake.calls if c[:2] == ["pane", "split"]]
-    assert fake.pane_runs() == [("w1:p1", "ct boss T --fg")]
+    assert fake.pane_runs() == [("w1:p1", "ct boss T --model fable --fg")]
 
 
 # --- CLI: space / worktree dry-run + guard -------------------------------
@@ -701,8 +703,8 @@ def test_space_dry_run_previews_workspace_and_launches(installed_ct):
     assert result.exit_code == 0
     assert "herdr workspace create --cwd" in result.stdout
     assert "# layout: left-stack, 3 pane(s)" in result.stdout
-    assert "[boss] claude-team boss DEMO --fg" in result.stdout
-    assert "[qa] claude-team qa DEMO --fg" in result.stdout
+    assert "[boss] claude-team boss DEMO --model fable --fg" in result.stdout
+    assert "[qa] claude-team qa DEMO --model claude-opus-5-5 --fg" in result.stdout
 
 
 def test_space_dry_run_respects_layout_and_roles(installed_ct):
@@ -720,17 +722,17 @@ def test_worktree_dry_run_previews_worktree_create(installed_ct):
     )
     assert result.exit_code == 0
     assert "herdr worktree create --cwd /repo --branch my-branch --base origin/dev" in result.stdout
-    assert "[boss] claude-team boss my-branch --fg" in result.stdout
+    assert "[boss] claude-team boss my-branch --model fable --fg" in result.stdout
 
 
 def test_worktree_open_dry_run_previews_worktree_open(installed_ct):
     result = runner.invoke(
-        app, ["worktree", "jesse/chom-893-resume", "--repo", "/repo", "--open", "--dry-run"]
+        app, ["worktree", "me/proj-123-resume", "--repo", "/repo", "--open", "--dry-run"]
     )
     assert result.exit_code == 0
-    assert "herdr worktree open --cwd /repo --branch jesse/chom-893-resume" in result.stdout
+    assert "herdr worktree open --cwd /repo --branch me/proj-123-resume" in result.stdout
     assert "--base" not in result.stdout  # open reuses an existing branch
-    assert "[boss] claude-team boss jesse/chom-893-resume --fg" in result.stdout
+    assert "[boss] claude-team boss me/proj-123-resume --model fable --fg" in result.stdout
 
 
 def test_space_requires_herdr_env_when_not_dry_run(installed_ct, monkeypatch):
@@ -754,7 +756,7 @@ def test_space_real_run_reports_workspace_and_panes(installed_ct, monkeypatch):
     assert "Boss" in result.stdout and "w1:p1" in result.stdout
     assert "teardown: herdr workspace close w1" in result.stdout
     # boss launched first, in the root pane
-    assert fake.pane_runs()[0] == ("w1:p1", "claude-team boss DEMO --fg")
+    assert fake.pane_runs()[0] == ("w1:p1", "claude-team boss DEMO --model fable --fg")
 
 
 def test_worktree_open_real_run_reports_and_uses_workspace_teardown(installed_ct, monkeypatch):
@@ -764,16 +766,16 @@ def test_worktree_open_real_run_reports_and_uses_workspace_teardown(installed_ct
     monkeypatch.setattr(cli, "herdr_available", lambda which=None: True)
 
     result = runner.invoke(
-        app, ["worktree", "jesse/chom-893-resume", "--repo", "/r", "--open", "--no-wait"]
+        app, ["worktree", "me/proj-123-resume", "--repo", "/r", "--open", "--no-wait"]
     )
     assert result.exit_code == 0, result.output
     assert "✓ workspace w3" in result.stdout
-    assert "opened existing worktree jesse/chom-893-resume" in result.stdout
+    assert "opened existing worktree me/proj-123-resume" in result.stdout
     # teardown closes the workspace only — never removes the pre-existing worktree/branch
     assert "teardown: herdr workspace close w3" in result.stdout
     assert "worktree remove" not in result.stdout
     # panes launched in the opened worktree's checkout
-    assert fake.pane_runs()[0] == ("w3:p1", "claude-team boss jesse/chom-893-resume --fg")
+    assert fake.pane_runs()[0] == ("w3:p1", "claude-team boss me/proj-123-resume --model fable --fg")
 
 
 def test_worktree_open_refuses_when_workspace_already_has_agents(installed_ct, monkeypatch):
@@ -859,7 +861,7 @@ def test_launch_plan_carries_prompt_into_argv():
 
 def test_pane_launch_command_includes_prompt():
     cmd = pane_launch_command(["claude-team"], BOSS, "T", None, prompt="/resume_handoff a b.md")
-    assert cmd == "claude-team boss T --prompt '/resume_handoff a b.md' --fg"
+    assert cmd == "claude-team boss T --prompt '/resume_handoff a b.md' --model fable --fg"
 
 
 def test_role_prompts_maps_each_role_when_selected():
@@ -893,8 +895,8 @@ def test_place_team_applies_boss_prompt_only_to_boss():
         [BOSS, DEVELOPER], "T", None, ["ct"], {BOSS: "/resume x"},
     )
     runs = dict(fake.pane_runs())
-    assert runs["w1:p1"] == "ct boss T --prompt '/resume x' --fg"  # boss carries it
-    assert runs["w1:p2"] == "ct dev T --fg"                        # dev does not
+    assert runs["w1:p1"] == "ct boss T --prompt '/resume x' --model fable --fg"  # boss carries it
+    assert runs["w1:p2"] == "ct dev T --model claude-opus-5-5 --fg"                        # dev does not
 
 
 def test_boss_prompt_cli_dry_run(terminal_env):
@@ -907,7 +909,7 @@ def test_dev_prompt_cli_dry_run_carries_checkin_system_prompt(terminal_env):
     result = runner.invoke(app, ["dev", "T", "--prompt", "/resume_handoff h.md", "--dry-run"])
     assert result.exit_code == 0
     assert result.stdout.strip() == (
-        "claude --name 'Developer: T' --model claude-opus-4-8 "
+        "claude --name 'Developer: T' --model claude-opus-5-5 "
         "--append-system-prompt 'Check in with boss.' '/resume_handoff h.md'"
     )
 
@@ -918,8 +920,8 @@ def test_space_boss_prompt_dry_run(installed_ct):
         ["space", "T", "--roles", "boss,dev", "--boss-prompt", "/resume_handoff h.md", "--dry-run"],
     )
     assert result.exit_code == 0
-    assert "[boss] claude-team boss T --prompt '/resume_handoff h.md' --fg" in result.stdout
-    assert "[dev] claude-team dev T --fg" in result.stdout  # dev unaffected
+    assert "[boss] claude-team boss T --prompt '/resume_handoff h.md' --model fable --fg" in result.stdout
+    assert "[dev] claude-team dev T --model claude-opus-5-5 --fg" in result.stdout  # dev unaffected
 
 
 def test_worktree_boss_prompt_dry_run(installed_ct):
@@ -928,7 +930,7 @@ def test_worktree_boss_prompt_dry_run(installed_ct):
         ["worktree", "br", "--repo", "/r", "--roles", "boss", "--boss-prompt", "/resume h.md", "--dry-run"],
     )
     assert result.exit_code == 0
-    assert "[boss] claude-team boss br --prompt '/resume h.md' --fg" in result.stdout
+    assert "[boss] claude-team boss br --prompt '/resume h.md' --model fable --fg" in result.stdout
 
 
 def test_space_boss_prompt_ignored_when_boss_not_in_roles(installed_ct):
@@ -952,9 +954,9 @@ def test_space_per_role_prompts_dry_run(installed_ct):
         ],
     )
     assert result.exit_code == 0
-    assert "[boss] claude-team boss T --prompt '/resume boss.md' --fg" in result.stdout
-    assert "[dev] claude-team dev T --prompt '/resume dev.md' --fg" in result.stdout
-    assert "[qa] claude-team qa T --prompt '/resume qa.md' --fg" in result.stdout
+    assert "[boss] claude-team boss T --prompt '/resume boss.md' --model fable --fg" in result.stdout
+    assert "[dev] claude-team dev T --prompt '/resume dev.md' --model claude-opus-5-5 --fg" in result.stdout
+    assert "[qa] claude-team qa T --prompt '/resume qa.md' --model claude-opus-5-5 --fg" in result.stdout
 
 
 def test_worktree_dev_prompt_dry_run(installed_ct):
@@ -963,7 +965,7 @@ def test_worktree_dev_prompt_dry_run(installed_ct):
         ["worktree", "br", "--repo", "/r", "--roles", "dev", "--dev-prompt", "/resume dev.md", "--dry-run"],
     )
     assert result.exit_code == 0
-    assert "[dev] claude-team dev br --prompt '/resume dev.md' --fg" in result.stdout
+    assert "[dev] claude-team dev br --prompt '/resume dev.md' --model claude-opus-5-5 --fg" in result.stdout
 
 
 def test_space_dev_prompt_ignored_when_dev_not_in_roles(installed_ct):
@@ -973,3 +975,97 @@ def test_space_dev_prompt_ignored_when_dev_not_in_roles(installed_ct):
     assert result.exit_code == 0
     assert "--prompt" not in result.stdout          # not applied to any pane
     assert "warning" in result.output.lower()       # but warned (stderr)
+
+
+# --- Model overrides -----------------------------------------------------
+def test_dev_and_qa_default_to_opus_5_5():
+    assert OPUS_55 == "claude-opus-5-5"
+
+
+def test_build_command_model_override_replaces_role_default():
+    cmd = build_command(DEVELOPER, "T", None, background=False, model="claude-sonnet-5")
+    assert cmd[cmd.index("--model") + 1] == "claude-sonnet-5"
+
+
+def test_launch_plan_carries_model_override():
+    plan = LaunchPlan(BOSS, "T", None, background=True, model="claude-opus-5-5")
+    assert "--model claude-opus-5-5" in plan.preview()
+
+
+@pytest.mark.parametrize(
+    "role, default", [("boss", "fable"), ("dev", "claude-opus-5-5"), ("qa", "claude-opus-5-5")]
+)
+def test_single_role_dry_run_uses_default_model(terminal_env, role, default):
+    result = runner.invoke(app, [role, "X", "--dry-run"])
+    assert result.exit_code == 0
+    assert f"--model {default}" in result.stdout
+
+
+@pytest.mark.parametrize("role", ["boss", "dev", "qa"])
+def test_single_role_model_flag_overrides(terminal_env, role):
+    result = runner.invoke(app, [role, "X", "--model", "claude-sonnet-5", "--dry-run"])
+    assert result.exit_code == 0
+    argv = cli.shlex.split(result.stdout.strip())
+    assert argv[argv.index("--model") + 1] == "claude-sonnet-5"
+    assert argv.count("--model") == 1
+
+
+def test_team_per_role_model_flags(terminal_env):
+    result = runner.invoke(
+        app,
+        ["team", "T", "--boss-model", "m-boss", "--dev-model", "m-dev",
+         "--qa-model", "m-qa", "--dry-run"],
+    )
+    assert result.exit_code == 0
+    boss_line, dev_line, qa_line = result.stdout.strip().splitlines()
+    assert "--model m-boss" in boss_line
+    assert "--model m-dev" in dev_line
+    assert "--model m-qa" in qa_line
+
+
+def test_team_default_models(terminal_env):
+    result = runner.invoke(app, ["team", "T", "--dry-run"])
+    boss_line, dev_line, qa_line = result.stdout.strip().splitlines()
+    assert "--model fable" in boss_line
+    assert "--model claude-opus-5-5" in dev_line
+    assert "--model claude-opus-5-5" in qa_line
+
+
+def test_space_dev_model_flag_reaches_dev_pane_only(installed_ct):
+    result = runner.invoke(app, ["space", "T", "--dev-model", "m-dev", "--dry-run"])
+    assert result.exit_code == 0
+    assert "[dev] claude-team dev T --model m-dev --fg" in result.stdout
+    assert "[boss] claude-team boss T --model fable --fg" in result.stdout
+    assert "[qa] claude-team qa T --model claude-opus-5-5 --fg" in result.stdout
+
+
+def test_worktree_model_flags_dry_run(installed_ct):
+    result = runner.invoke(
+        app,
+        ["worktree", "br", "--repo", "/r", "--boss-model", "m-boss",
+         "--qa-model", "m-qa", "--dry-run"],
+    )
+    assert result.exit_code == 0
+    assert "[boss] claude-team boss br --model m-boss --fg" in result.stdout
+    assert "[qa] claude-team qa br --model m-qa --fg" in result.stdout
+
+
+def test_place_team_passes_models_into_pane_commands():
+    fake = FakeHerdrRunner()
+    place_team(
+        Herdr(fake), LeftStackLayout(), "w1:p1", "/x", [BOSS, DEVELOPER],
+        "T", None, ["ct"], models={DEVELOPER: "m-dev"},
+    )
+    runs = dict(fake.pane_runs())
+    assert runs["w1:p1"] == "ct boss T --model fable --fg"
+    assert runs["w1:p2"] == "ct dev T --model m-dev --fg"
+
+
+def test_pane_command_round_trips_through_the_cli(terminal_env):
+    """The --model a pane sends is accepted by the role command it invokes."""
+    cmd = pane_launch_command(["claude-team"], QA, "T", None, model="m-qa")
+    args = cli.shlex.split(cmd)[1:]
+    args[args.index("--fg")] = "--dry-run"
+    result = runner.invoke(app, args)
+    assert result.exit_code == 0
+    assert "--model m-qa" in result.stdout

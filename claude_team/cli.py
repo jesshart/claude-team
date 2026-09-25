@@ -29,10 +29,11 @@ from typing import Callable, List, Mapping, Optional, Tuple
 import typer
 
 # --- Models --------------------------------------------------------------
-# `fable` is an alias for the latest Fable; Opus 4.8 is pinned by full name
+# `fable` is an alias for the latest Fable; Opus 5.5 is pinned by full name
 # because the `opus` alias tracks the newest Opus, not this specific version.
+# Each is only a role default: every launch command takes a model override.
 FABLE = "fable"
-OPUS_48 = "claude-opus-4-8"
+OPUS_55 = "claude-opus-5-5"
 
 CHECK_IN_PROMPT = "Check in with boss"
 
@@ -47,8 +48,8 @@ class Role:
 
 
 BOSS = Role(label="Boss", model=FABLE)
-DEVELOPER = Role(label="Developer", model=OPUS_48, prompt=CHECK_IN_PROMPT)
-QA = Role(label="QA", model=OPUS_48, prompt=CHECK_IN_PROMPT)
+DEVELOPER = Role(label="Developer", model=OPUS_55, prompt=CHECK_IN_PROMPT)
+QA = Role(label="QA", model=OPUS_55, prompt=CHECK_IN_PROMPT)
 
 ROLES = {"boss": BOSS, "developer": DEVELOPER, "qa": QA}
 
@@ -86,8 +87,11 @@ def build_command(
     suffix: Optional[str],
     background: bool,
     prompt: Optional[str] = None,
+    model: Optional[str] = None,
 ) -> List[str]:
     """Build the ``claude`` argv for ``role``.
+
+    ``model`` overrides the role's default model when given (``None`` keeps it).
 
     ``prompt`` overrides the role's default opening prompt when given — e.g. a
     ``/resume_handoff …`` slash command for the boss, which otherwise opens with
@@ -104,7 +108,7 @@ def build_command(
     cmd = ["claude"]
     if background:
         cmd.append("--bg")
-    cmd += ["--name", build_name(role, topic, suffix), "--model", role.model]
+    cmd += ["--name", build_name(role, topic, suffix), "--model", model or role.model]
     if (
         prompt is not None
         and role != BOSS
@@ -169,6 +173,7 @@ class LaunchPlan:
     suffix: Optional[str]
     background: bool
     prompt: Optional[str] = None
+    model: Optional[str] = None
 
     @property
     def name(self) -> str:
@@ -176,7 +181,8 @@ class LaunchPlan:
 
     def argv(self) -> List[str]:
         return build_command(
-            self.role, self.topic, self.suffix, self.background, self.prompt
+            self.role, self.topic, self.suffix, self.background, self.prompt,
+            self.model,
         )
 
     def preview(self) -> str:
@@ -211,13 +217,14 @@ def launch(
     background_override: Optional[bool],
     dry_run: bool,
     prompt: Optional[str] = None,
+    model: Optional[str] = None,
 ) -> None:
     """Build the invocation for ``role`` and start it (or preview it).
 
-    ``prompt`` overrides the role's default opening prompt when given.
+    ``prompt`` / ``model`` override the role's default opening prompt / model.
     """
     background = decide_background(background_override, os.environ, stdout_isatty())
-    plan = LaunchPlan(role, topic, suffix, background, prompt)
+    plan = LaunchPlan(role, topic, suffix, background, prompt, model)
 
     if dry_run:
         typer.echo(plan.preview())
@@ -441,13 +448,19 @@ def pane_launch_command(
     topic: str,
     suffix: Optional[str],
     prompt: Optional[str] = None,
+    model: Optional[str] = None,
 ) -> str:
-    """The shell command sent into a pane to launch one role foreground there."""
+    """The shell command sent into a pane to launch one role foreground there.
+
+    The model is always passed explicitly (``model`` or the role default), so the
+    pane runs the model this invocation resolved, whatever its own default is.
+    """
     argv = list(invocation) + [role_token(role), topic]
     if suffix and suffix.strip():
         argv += ["--suffix", suffix]
     if prompt:
         argv += ["--prompt", prompt]
+    argv += ["--model", model or role.model]
     argv.append("--fg")
     return shlex.join(argv)
 
@@ -579,20 +592,25 @@ def place_team(
     suffix: Optional[str],
     invocation: List[str],
     prompts: Optional[Mapping[Role, str]] = None,
+    models: Optional[Mapping[Role, str]] = None,
 ) -> List[Tuple[Role, str]]:
     """Grow ``root_pane`` into the layout, then launch one role per pane.
 
     Roles arrive in canonical order (boss first), and pane 0 is the root, so the
     boss is always launched first — the dev/qa "check in with boss" prompt lands
-    on a live session. ``prompts`` overrides a role's opening prompt by role.
+    on a live session. ``prompts`` / ``models`` override a role's opening prompt /
+    model by role.
     """
     prompts = prompts or {}
+    models = models or {}
     panes = [root_pane]
     for step in layout.plan(len(roles)):
         panes.append(herdr.split(panes[step.source], step, cwd))
     placements = list(zip(roles, panes))
     for role, pane in placements:
-        cmd = pane_launch_command(invocation, role, topic, suffix, prompts.get(role))
+        cmd = pane_launch_command(
+            invocation, role, topic, suffix, prompts.get(role), models.get(role)
+        )
         herdr.run_in_pane(pane, cmd)
     return placements
 
@@ -605,9 +623,11 @@ def preview_placement(
     invocation: List[str],
     cwd: str,
     prompts: Optional[Mapping[Role, str]] = None,
+    models: Optional[Mapping[Role, str]] = None,
 ) -> List[str]:
     """Human-readable dry-run of the splits + per-pane launches (no pane ids yet)."""
     prompts = prompts or {}
+    models = models or {}
     tokens = [role_token(r) for r in roles]
     refs = [f"<{tokens[0]}>"]
     lines = [f"# layout: {layout.name}, {len(roles)} pane(s)"]
@@ -616,7 +636,9 @@ def preview_placement(
         refs.append(f"<{tokens[idx]}>")
     lines.append("# per-pane launch (foreground):")
     for role in roles:
-        cmd = pane_launch_command(invocation, role, topic, suffix, prompts.get(role))
+        cmd = pane_launch_command(
+            invocation, role, topic, suffix, prompts.get(role), models.get(role)
+        )
         lines.append(f"[{role_token(role)}] {cmd}")
     return lines
 
@@ -746,16 +768,33 @@ PromptOpt = typer.Option(
 )
 
 
+
+def model_option(default: str, flag: str = "--model", role: str = "the session"):
+    """A model-override option for ``role``, defaulting to its pinned model."""
+    return typer.Option(default, flag, help=f"Model for {role} (default: {default}).")
+
+
+BossModelOpt = model_option(FABLE, "--boss-model", "the boss")
+DevModelOpt = model_option(OPUS_55, "--dev-model", "the developer")
+QaModelOpt = model_option(OPUS_55, "--qa-model", "QA")
+
+
+def role_models(boss_model: str, dev_model: str, qa_model: str) -> dict:
+    """Map each role to the model it should launch with."""
+    return {BOSS: boss_model, DEVELOPER: dev_model, QA: qa_model}
+
+
 @app.command()
 def boss(
     topic: str = TopicArg,
     suffix: Optional[str] = SuffixOpt,
     background: Optional[bool] = BgOpt,
     prompt: Optional[str] = PromptOpt,
+    model: str = model_option(FABLE),
     dry_run: bool = DryRunOpt,
 ) -> None:
-    """Launch the Boss agent (Fable; no opening prompt unless --prompt given)."""
-    launch(BOSS, topic, suffix, background, dry_run, prompt)
+    """Launch the Boss agent (Fable by default; no opening prompt unless --prompt given)."""
+    launch(BOSS, topic, suffix, background, dry_run, prompt, model)
 
 
 @app.command()
@@ -764,10 +803,11 @@ def dev(
     suffix: Optional[str] = SuffixOpt,
     background: Optional[bool] = BgOpt,
     prompt: Optional[str] = PromptOpt,
+    model: str = model_option(OPUS_55),
     dry_run: bool = DryRunOpt,
 ) -> None:
-    """Launch the Developer agent (Opus 4.8, opens by checking in with boss)."""
-    launch(DEVELOPER, topic, suffix, background, dry_run, prompt)
+    """Launch the Developer agent (Opus 5.5 by default, opens by checking in with boss)."""
+    launch(DEVELOPER, topic, suffix, background, dry_run, prompt, model)
 
 
 @app.command()
@@ -776,10 +816,11 @@ def qa(
     suffix: Optional[str] = SuffixOpt,
     background: Optional[bool] = BgOpt,
     prompt: Optional[str] = PromptOpt,
+    model: str = model_option(OPUS_55),
     dry_run: bool = DryRunOpt,
 ) -> None:
-    """Launch the QA agent (Opus 4.8, opens by checking in with boss)."""
-    launch(QA, topic, suffix, background, dry_run, prompt)
+    """Launch the QA agent (Opus 5.5 by default, opens by checking in with boss)."""
+    launch(QA, topic, suffix, background, dry_run, prompt, model)
 
 
 @app.command()
@@ -791,11 +832,16 @@ def team(
         "--roles",
         help="Comma-separated subset of the team to launch, e.g. boss,qa.",
     ),
+    boss_model: str = BossModelOpt,
+    dev_model: str = DevModelOpt,
+    qa_model: str = QaModelOpt,
     dry_run: bool = DryRunOpt,
 ) -> None:
     """Launch the whole team on TOPIC — each role backgrounded and attachable."""
+    models = role_models(boss_model, dev_model, qa_model)
     plans = [
-        LaunchPlan(role, topic, suffix, background=True) for role in parse_roles(roles)
+        LaunchPlan(role, topic, suffix, background=True, model=models[role])
+        for role in parse_roles(roles)
     ]
     launch_team(plans, dry_run)
 
@@ -871,6 +917,9 @@ def space(
     boss_prompt: Optional[str] = BossPromptOpt,
     dev_prompt: Optional[str] = DevPromptOpt,
     qa_prompt: Optional[str] = QaPromptOpt,
+    boss_model: str = BossModelOpt,
+    dev_model: str = DevModelOpt,
+    qa_model: str = QaModelOpt,
     wait: bool = WaitOpt,
     dry_run: bool = DryRunOpt,
 ) -> None:
@@ -881,10 +930,11 @@ def space(
     ws_label = (label or topic).strip()
     invocation = claude_team_invocation()
     prompts = role_prompts(selected, boss_prompt, dev_prompt, qa_prompt)
+    models = role_models(boss_model, dev_model, qa_model)
 
     if dry_run:
         typer.echo(shlex.join(["herdr", *workspace_create_argv(work_cwd, ws_label)]))
-        for line in preview_placement(strategy, selected, topic, suffix, invocation, work_cwd, prompts):
+        for line in preview_placement(strategy, selected, topic, suffix, invocation, work_cwd, prompts, models):
             typer.echo(line)
         raise typer.Exit()
 
@@ -893,7 +943,7 @@ def space(
     try:
         ws_id, root_pane = herdr.create_workspace(work_cwd, ws_label)
         placements = place_team(
-            herdr, strategy, root_pane, work_cwd, selected, topic, suffix, invocation, prompts
+            herdr, strategy, root_pane, work_cwd, selected, topic, suffix, invocation, prompts, models
         )
     except HerdrError as exc:
         typer.echo(f"error: {exc}", err=True)
@@ -904,7 +954,7 @@ def space(
 @app.command()
 def worktree(
     branch: str = typer.Argument(
-        ..., metavar="BRANCH", help="New branch / worktree name (e.g. jesse/chom-123-...)."
+        ..., metavar="BRANCH", help="New branch / worktree name (e.g. me/proj-123-...)."
     ),
     repo: Optional[str] = typer.Option(
         None, "--repo", help="Repo path to branch from (default: current dir)."
@@ -933,6 +983,9 @@ def worktree(
     boss_prompt: Optional[str] = BossPromptOpt,
     dev_prompt: Optional[str] = DevPromptOpt,
     qa_prompt: Optional[str] = QaPromptOpt,
+    boss_model: str = BossModelOpt,
+    dev_model: str = DevModelOpt,
+    qa_model: str = QaModelOpt,
     wait: bool = WaitOpt,
     dry_run: bool = DryRunOpt,
 ) -> None:
@@ -951,6 +1004,7 @@ def worktree(
     ws_label = (label or branch).strip()
     invocation = claude_team_invocation()
     prompts = role_prompts(selected, boss_prompt, dev_prompt, qa_prompt)
+    models = role_models(boss_model, dev_model, qa_model)
 
     create_argv = (
         worktree_open_argv(repo_path, branch)
@@ -959,7 +1013,7 @@ def worktree(
     )
     if dry_run:
         typer.echo(shlex.join(["herdr", *create_argv]))
-        for line in preview_placement(strategy, selected, team_topic, suffix, invocation, "<checkout>", prompts):
+        for line in preview_placement(strategy, selected, team_topic, suffix, invocation, "<checkout>", prompts, models):
             typer.echo(line)
         raise typer.Exit()
 
@@ -982,7 +1036,7 @@ def worktree(
         else:
             ws_id, root_pane, checkout = herdr.create_worktree(repo_path, branch, base, ws_label)
         placements = place_team(
-            herdr, strategy, root_pane, checkout or repo_path, selected, team_topic, suffix, invocation, prompts
+            herdr, strategy, root_pane, checkout or repo_path, selected, team_topic, suffix, invocation, prompts, models
         )
     except HerdrError as exc:
         typer.echo(f"error: {exc}", err=True)
@@ -1040,8 +1094,11 @@ def render_quickstart(state: dict) -> str:
         "| command | session name       | model             | opening prompt      |",
         "| ------- | ------------------ | ----------------- | ------------------- |",
         "| boss    | Boss: <topic>      | fable             | (none)              |",
-        "| dev     | Developer: <topic> | claude-opus-4-8   | Check in with boss  |",
-        "| qa      | QA: <topic>        | claude-opus-4-8   | Check in with boss  |",
+        "| dev     | Developer: <topic> | claude-opus-5-5   | Check in with boss  |",
+        "| qa      | QA: <topic>        | claude-opus-5-5   | Check in with boss  |",
+        "",
+        "Override a model with `--model` on boss/dev/qa, or `--boss-model` /"
+        " `--dev-model` / `--qa-model` on team, space and worktree.",
         "",
         "`<topic>` is a Linear ticket or any string. `--suffix \"Handoff 1\"` appends"
         " to the name so you can spin up a fresh agent on the same topic.",

@@ -32,8 +32,8 @@ uv run claude-team --help
 
 ```bash
 claude-team boss PROJ-123          # -> claude -n "Boss: PROJ-123"      --model fable
-claude-team dev  PROJ-123          # -> claude -n "Developer: PROJ-123" --model claude-opus-4-8 "Check in with boss"
-claude-team qa   PROJ-123          # -> claude -n "QA: PROJ-123"        --model claude-opus-4-8 "Check in with boss"
+claude-team dev  PROJ-123          # -> claude -n "Developer: PROJ-123" --model claude-opus-5-5 "Check in with boss"
+claude-team qa   PROJ-123          # -> claude -n "QA: PROJ-123"        --model claude-opus-5-5 "Check in with boss"
 ```
 
 `TOPIC` is a Linear ticket **or any free-form string**:
@@ -98,7 +98,7 @@ open with `"Check in with boss"`. Override any role with `--boss-prompt` /
 its own handoff:
 
 ```bash
-claude-team space CHOM-893 --suffix "Handoff Day 2" \
+claude-team space PROJ-123 --suffix "Handoff Day 2" \
   --boss-prompt '/resume_handoff boss.md' \
   --dev-prompt  '/resume_handoff dev.md' \
   --qa-prompt   '/resume_handoff qa.md'
@@ -117,7 +117,7 @@ Start the team **on a fresh git worktree** in one step — it creates the branch
 the checkout, and the workspace, then launches the team on that branch:
 
 ```bash
-claude-team worktree jesse/chom-123-thing --repo ~/code/app    # branch off origin/dev
+claude-team worktree me/proj-123-thing --repo ~/code/app    # branch off origin/dev
 claude-team worktree my-spike --base main --topic "spike idea"  # custom base + topic
 claude-team worktree my-spike --dry-run                         # preview, create nothing
 ```
@@ -127,7 +127,7 @@ team nests under that repo's tree in Herdr instead of floating in a standalone
 space — the difference between a *worktree-workspace* and a bare `space`:
 
 ```bash
-claude-team worktree jesse/chom-123-thing --repo ~/code/app --open   # reuse the existing checkout
+claude-team worktree me/proj-123-thing --repo ~/code/app --open   # reuse the existing checkout
 ```
 
 A git worktree maps to a single Herdr workspace, so `--open` on a worktree that
@@ -278,11 +278,19 @@ launches foreground or background, and a live snapshot of running team sessions
 
 ## Roles
 
-| Command | Session name       | Model            | Opening prompt      |
-| ------- | ------------------ | ---------------- | ------------------- |
-| `boss`  | `Boss: <topic>`      | `fable`          | (none)              |
-| `dev`   | `Developer: <topic>` | `claude-opus-4-8` | `Check in with boss` |
-| `qa`    | `QA: <topic>`        | `claude-opus-4-8` | `Check in with boss` |
+| Command | Session name         | Default model     | Opening prompt       |
+| ------- | -------------------- | ----------------- | -------------------- |
+| `boss`  | `Boss: <topic>`      | `fable`           | (none)               |
+| `dev`   | `Developer: <topic>` | `claude-opus-5-5` | `Check in with boss` |
+| `qa`    | `QA: <topic>`        | `claude-opus-5-5` | `Check in with boss` |
+
+Models are overridable too: the single-role commands take `--model`, and `team` /
+`space` / `worktree` take `--boss-model` / `--dev-model` / `--qa-model`:
+
+```bash
+claude-team dev PROJ-123 --model claude-sonnet-5
+claude-team space PROJ-123 --dev-model claude-sonnet-5 --qa-model claude-sonnet-5
+```
 
 Opening prompts are overridable: the single-role commands take `--prompt`, and
 the paned `space` / `worktree` commands take `--boss-prompt` / `--dev-prompt` /
