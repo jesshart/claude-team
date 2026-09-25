@@ -954,7 +954,7 @@ def space(
 @app.command()
 def worktree(
     branch: str = typer.Argument(
-        ..., metavar="BRANCH", help="New branch / worktree name (e.g. jesse/chom-123-...)."
+        ..., metavar="BRANCH", help="New branch / worktree name (e.g. me/proj-123-...)."
     ),
     repo: Optional[str] = typer.Option(
         None, "--repo", help="Repo path to branch from (default: current dir)."

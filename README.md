@@ -98,7 +98,7 @@ open with `"Check in with boss"`. Override any role with `--boss-prompt` /
 its own handoff:
 
 ```bash
-claude-team space CHOM-893 --suffix "Handoff Day 2" \
+claude-team space PROJ-123 --suffix "Handoff Day 2" \
   --boss-prompt '/resume_handoff boss.md' \
   --dev-prompt  '/resume_handoff dev.md' \
   --qa-prompt   '/resume_handoff qa.md'
@@ -117,7 +117,7 @@ Start the team **on a fresh git worktree** in one step — it creates the branch
 the checkout, and the workspace, then launches the team on that branch:
 
 ```bash
-claude-team worktree jesse/chom-123-thing --repo ~/code/app    # branch off origin/dev
+claude-team worktree me/proj-123-thing --repo ~/code/app    # branch off origin/dev
 claude-team worktree my-spike --base main --topic "spike idea"  # custom base + topic
 claude-team worktree my-spike --dry-run                         # preview, create nothing
 ```
@@ -127,7 +127,7 @@ team nests under that repo's tree in Herdr instead of floating in a standalone
 space — the difference between a *worktree-workspace* and a bare `space`:
 
 ```bash
-claude-team worktree jesse/chom-123-thing --repo ~/code/app --open   # reuse the existing checkout
+claude-team worktree me/proj-123-thing --repo ~/code/app --open   # reuse the existing checkout
 ```
 
 A git worktree maps to a single Herdr workspace, so `--open` on a worktree that

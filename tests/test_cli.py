@@ -727,12 +727,12 @@ def test_worktree_dry_run_previews_worktree_create(installed_ct):
 
 def test_worktree_open_dry_run_previews_worktree_open(installed_ct):
     result = runner.invoke(
-        app, ["worktree", "jesse/chom-893-resume", "--repo", "/repo", "--open", "--dry-run"]
+        app, ["worktree", "me/proj-123-resume", "--repo", "/repo", "--open", "--dry-run"]
     )
     assert result.exit_code == 0
-    assert "herdr worktree open --cwd /repo --branch jesse/chom-893-resume" in result.stdout
+    assert "herdr worktree open --cwd /repo --branch me/proj-123-resume" in result.stdout
     assert "--base" not in result.stdout  # open reuses an existing branch
-    assert "[boss] claude-team boss jesse/chom-893-resume --model fable --fg" in result.stdout
+    assert "[boss] claude-team boss me/proj-123-resume --model fable --fg" in result.stdout
 
 
 def test_space_requires_herdr_env_when_not_dry_run(installed_ct, monkeypatch):
@@ -766,16 +766,16 @@ def test_worktree_open_real_run_reports_and_uses_workspace_teardown(installed_ct
     monkeypatch.setattr(cli, "herdr_available", lambda which=None: True)
 
     result = runner.invoke(
-        app, ["worktree", "jesse/chom-893-resume", "--repo", "/r", "--open", "--no-wait"]
+        app, ["worktree", "me/proj-123-resume", "--repo", "/r", "--open", "--no-wait"]
     )
     assert result.exit_code == 0, result.output
     assert "✓ workspace w3" in result.stdout
-    assert "opened existing worktree jesse/chom-893-resume" in result.stdout
+    assert "opened existing worktree me/proj-123-resume" in result.stdout
     # teardown closes the workspace only — never removes the pre-existing worktree/branch
     assert "teardown: herdr workspace close w3" in result.stdout
     assert "worktree remove" not in result.stdout
     # panes launched in the opened worktree's checkout
-    assert fake.pane_runs()[0] == ("w3:p1", "claude-team boss jesse/chom-893-resume --model fable --fg")
+    assert fake.pane_runs()[0] == ("w3:p1", "claude-team boss me/proj-123-resume --model fable --fg")
 
 
 def test_worktree_open_refuses_when_workspace_already_has_agents(installed_ct, monkeypatch):
