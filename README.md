@@ -164,6 +164,54 @@ attach ids — you watch and drive them in Herdr directly. The boss is always
 launched first, so the dev/qa "check in with boss" prompt lands on a live
 session.
 
+## …or in Rex
+
+The same `space` and `worktree` commands also run on
+[Rex](https://www.superlogical.com/rex). Inside a Rex terminal (`REX_SESSION`
+is set) they pick Rex automatically. Use `--backend rex` or `--backend herdr`
+to choose one yourself. Only the `rex` binary needs to be on `PATH`.
+
+```bash
+claude-team space PROJ-123                          # new Rex session, boss/dev/qa in blocks
+claude-team worktree me/proj-123-thing --repo ~/code/app
+claude-team worktree me/proj-123-thing --repo ~/code/app --open
+claude-team space PROJ-123 --backend rex --dry-run  # preview the rex commands
+```
+
+Rex nests **sessions > windows (tabs) > blocks (terminals)**, and
+`claude-team` files a team into that structure by git:
+
+| Rex level | In a git repo | Outside a git repo |
+| --- | --- | --- |
+| Session | the repo name (shared by every worktree of the repo) | the topic / `--label` |
+| Window | the worktree name (its checkout directory) | `team` |
+| Block | one per role, with Rex's default name; Claude Code runs here | same |
+
+A linked worktree reports its *main* repo's name, so every worktree of `app`
+lands as a window in the one `app` session. The main checkout's window is named
+after its directory, which is `app`.
+
+- **The report maps each role to its block ID**, so you can reach a role
+  directly, for example `rex capture -s app -b <block id>`.
+- **Rex has no worktree command, so git creates the worktree.**
+  `git worktree add` puts the checkout beside the repo at
+  `<repo>.worktrees/<branch>`, with `/` replaced by `-`. The checkout
+  directory is also the window name, so `me/proj-123-thing` becomes the window
+  `me-proj-123-thing`.
+- **`--open` finds the checkout with `git worktree list` and reuses that
+  worktree's window in the repo session, if one is open.** Rex doesn't detect
+  agents, so any terminal in that window counts as a running team. Unless you
+  pass `--force`, the command refuses to add to a window that already has one.
+  With `--force`, the new team gets a second window with the same name.
+- **Teardown:** in a repo, `rex window close` closes the team's window and
+  leaves the repo session and its other teams alone. The repo session stays
+  in place, even empty, until you `rex kill` it. Outside a repo it's
+  `rex kill <session>`. For a new worktree, also run
+  `git worktree remove <checkout>` and `git branch -D <branch>`. The command
+  prints all of these.
+- The status report has no agent status (`[idle]`/`[working]`), because only
+  Herdr reports it.
+
 ## Foreground vs. background
 
 The launch mode is **auto-detected**:

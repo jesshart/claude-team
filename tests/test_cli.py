@@ -690,8 +690,11 @@ def test_place_team_single_role_no_splits():
 # --- CLI: space / worktree dry-run + guard -------------------------------
 @pytest.fixture
 def installed_ct(monkeypatch):
-    """Make invocation deterministic: claude-team is durably installed."""
+    """Make invocation deterministic: claude-team is durably installed, and no
+    multiplexer is detected (so `--backend auto` resolves to herdr)."""
     monkeypatch.delenv("VIRTUAL_ENV", raising=False)
+    monkeypatch.delenv("REX_SESSION", raising=False)
+    monkeypatch.delenv("HERDR_ENV", raising=False)
     monkeypatch.setattr(
         cli.shutil, "which",
         lambda name: "/opt/bin/claude-team" if name == "claude-team" else None,
@@ -1069,3 +1072,352 @@ def test_pane_command_round_trips_through_the_cli(terminal_env):
     result = runner.invoke(app, args)
     assert result.exit_code == 0
     assert "--model m-qa" in result.stdout
+
+
+# --- Rex backend ----------------------------------------------------------
+class FakeRexRunner:
+    """Records `rex <args>` calls and returns canned JSON, no live server.
+
+    ``sessions`` / ``windows`` / ``blocks`` seed what `rex ls`, `rex window ls`
+    and `rex block ls` report, so a test can stand up an already-running team."""
+
+    def __init__(self, sessions=(), windows=(), blocks=(), screen="Welcome to Claude Code"):
+        self.calls = []
+        self._block_seq = 1
+        self.sessions = list(sessions)
+        self.windows = list(windows)
+        self.blocks = list(blocks)
+        self.screen = screen
+
+    def __call__(self, args):
+        self.calls.append(args)
+        out = self._result(args)
+        stdout = out if isinstance(out, str) else (json.dumps(out) if out else "")
+        return subprocess.CompletedProcess(args, 0, stdout=stdout, stderr="")
+
+    def _result(self, args):
+        if args[0] == "new":
+            return {"session_id": "session:s1", "initial_windows": [
+                {"window_id": "window:w1", "block_ids": ["block:b1"]}]}
+        if args[:2] == ["window", "new"]:
+            return {"window_id": "window:w2", "block_ids": ["block:b9"]}
+        if args[:2] == ["window", "ls"]:
+            return {"windows": self.windows}
+        if args[0] == "split":
+            self._block_seq += 1
+            return {"block_ids": [f"block:b{self._block_seq}"]}
+        if args[0] == "ls":
+            return {"sessions": self.sessions}
+        if args[:2] == ["block", "ls"]:
+            return {"blocks": self.blocks}
+        if args[0] == "capture":
+            return self.screen
+        return None  # send / block rename print nothing
+
+    def sends(self):
+        """(block_id, text) for each `rex send`, in call order."""
+        return [(c[c.index("-b") + 1], c[-1]) for c in self.calls if c[0] == "send"]
+
+    def made(self):
+        """Every call that creates something: sessions, windows, or blocks."""
+        return [c for c in self.calls if c[0] in ("new", "split") or c[:2] == ["window", "new"]]
+
+
+class FakeGit:
+    """Answers `git worktree list` from ``porcelain`` and `git rev-parse
+    --git-common-dir --show-toplevel` from ``repos`` (path prefix -> common
+    dir; the toplevel is the path itself); any other path is "not a git
+    repository"."""
+
+    def __init__(self, porcelain="", repos=None):
+        self.calls = []
+        self.porcelain = porcelain
+        self.repos = repos or {}
+
+    def __call__(self, args):
+        self.calls.append(args)
+        if "--git-common-dir" in args:
+            path = args[1]
+            for prefix, common in self.repos.items():
+                if path.startswith(prefix):
+                    out = f"{common}\n{path}\n"
+                    return subprocess.CompletedProcess(args, 0, stdout=out, stderr="")
+            return subprocess.CompletedProcess(args, 128, stdout="", stderr="fatal: not a git repository")
+        out = self.porcelain if "list" in args else ""
+        return subprocess.CompletedProcess(args, 0, stdout=out, stderr="")
+
+    def mutations(self):
+        return [c for c in self.calls if "rev-parse" not in c and "list" not in c]
+
+
+PORCELAIN = (
+    "worktree /r\nHEAD abc\nbranch refs/heads/main\n\n"
+    "worktree /r.worktrees/me-br\nHEAD def\nbranch refs/heads/me/br\n"
+)
+# /r and its linked worktrees all share /r/.git, so they are one repo: "r".
+REPO_R = {"/r": "/r/.git"}
+
+
+def test_rex_split_argv_converts_kept_share_to_new_block_percent():
+    # SplitStep.ratio is what the original keeps; rex --ratio is the new block's share.
+    argv = cli.rex_split_argv("S", "B", SplitStep(0, "down", 1 / 3), "/x")
+    assert argv[argv.index("--split") + 1] == "below"
+    assert argv[argv.index("--ratio") + 1] == "67"
+    assert "--focus=false" in argv
+    assert "--ratio" not in cli.rex_split_argv("S", "B", SplitStep(0, "right"), "/x")
+
+
+def test_find_worktree_matches_branch_exactly():
+    assert cli.find_worktree(PORCELAIN, "me/br") == "/r.worktrees/me-br"
+    assert cli.find_worktree(PORCELAIN, "main") == "/r"
+    assert cli.find_worktree(PORCELAIN, "me") is None
+
+
+def test_worktree_checkout_path_is_a_sibling_dir(tmp_path):
+    repo = tmp_path / "app"
+    assert cli.worktree_checkout_path(str(repo), "me/proj-1") == str(
+        tmp_path / "app.worktrees" / "me-proj-1"
+    )
+
+
+def test_git_location_names_the_main_repo_and_the_worktree():
+    git = FakeGit(repos={"/code/app.worktrees/me-br": "/code/app/.git"})
+    assert cli.git_location("/code/app.worktrees/me-br", git) == ("app", "me-br")
+    assert cli.git_location("/tmp/loose", git) is None
+
+
+def test_git_location_on_a_real_repo_and_linked_worktree(tmp_path):
+    repo = tmp_path / "myrepo"
+    git = ["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@t"]
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run([*git, "commit", "-q", "--allow-empty", "-m", "init"], check=True)
+    linked = tmp_path / "myrepo.worktrees" / "me-br"
+    subprocess.run([*git, "worktree", "add", "-q", "-b", "me/br", str(linked)], check=True)
+    assert cli.git_location(str(repo)) == ("myrepo", "myrepo")
+    assert cli.git_location(str(linked)) == ("myrepo", "me-br")
+    assert cli.git_location(str(tmp_path)) is None
+
+
+def test_resolve_backend_auto_detects_the_running_multiplexer():
+    assert cli.resolve_backend("auto", {"REX_SESSION": "session:x"}) == "rex"
+    assert cli.resolve_backend("auto", {"HERDR_ENV": "1", "REX_SESSION": "x"}) == "herdr"
+    assert cli.resolve_backend("auto", {}) == "herdr"
+    assert cli.resolve_backend("rex", {}) == "rex"
+    with pytest.raises(cli.typer.BadParameter):
+        cli.resolve_backend("tmux", {})
+
+
+def test_place_team_on_rex_labels_blocks_and_sends_commands_boss_first():
+    fake = FakeRexRunner()
+    rex = cli.Rex(fake, git=FakeGit())
+    session, root = rex.create_workspace("/x", "T")
+    placements = place_team(rex, LeftStackLayout(), root, "/x", [BOSS, DEVELOPER, QA], "T", None, ["ct"])
+    assert session == "session:s1"
+    assert [p for _, p in placements] == ["block:b1", "block:b2", "block:b3"]
+    assert not [c for c in fake.calls if c[:2] == ["block", "rename"]]  # rex's default names
+    sends = fake.sends()
+    assert sends[0] == ("block:b1", "ct boss T --model fable --fg\r")
+    # every block is addressed within the session we created
+    assert all(c[c.index("-s") + 1] == "session:s1" for c in fake.calls if c[0] in ("split", "send"))
+
+
+def test_rex_outside_a_repo_gives_the_team_its_own_session():
+    fake = FakeRexRunner()
+    rex = cli.Rex(fake, git=FakeGit())
+    rex.create_workspace("/tmp/loose", "DEMO")
+    assert fake.made() == [cli.rex_new_argv("/tmp/loose", "DEMO", "team")]
+    assert rex.close_command("session:s1") == "rex kill session:s1"
+
+
+def test_rex_in_a_repo_opens_the_repo_session_with_a_window_per_team():
+    fake = FakeRexRunner()
+    rex = cli.Rex(fake, git=FakeGit(repos=REPO_R))
+    rex.create_workspace("/r", "PROJ-1")
+    # first team on the repo: the session is named after the repo, the window
+    # after the worktree (the main checkout here), never the topic
+    assert fake.made() == [cli.rex_new_argv("/r", "r", "r")]
+    assert rex.close_command("session:s1") == "rex window close -s session:s1 window:w1"
+
+
+def test_rex_in_a_repo_adds_a_window_to_the_open_repo_session():
+    fake = FakeRexRunner(sessions=[{"session_id": "session:repo", "label": "r"}])
+    rex = cli.Rex(fake, git=FakeGit(repos=REPO_R))
+    session, root = rex.create_workspace("/r.worktrees/me-br", "PROJ-2")
+    assert (session, root) == ("session:repo", "block:b9")
+    assert fake.made() == [cli.rex_window_argv("session:repo", "/r.worktrees/me-br", "me-br")]
+    assert rex.close_command(session) == "rex window close -s session:repo window:w2"
+
+
+def test_rex_team_count_ignores_other_windows_of_the_repo_session():
+    fake = FakeRexRunner(blocks=[
+        {"block_id": "block:a", "window_id": "window:mine"},
+        {"block_id": "block:b", "window_id": "window:other"},
+        {"block_id": "block:c", "window_id": "window:mine"},
+    ])
+    rex = cli.Rex(fake, git=FakeGit())
+    rex.window = "window:mine"
+    assert [a["pane_id"] for a in rex.agents_in_workspace("session:repo")] == ["block:a", "block:c"]
+
+
+def test_rex_wait_for_output_stops_on_match_or_deadline():
+    now = [0.0]
+    sleeps = []
+
+    def sleep(s):
+        sleeps.append(s)
+        now[0] += s
+
+    booted = cli.Rex(FakeRexRunner(screen="? for shortcuts"), sleep=sleep, clock=lambda: now[0])
+    booted.wait_for_output("block:b1", cli.BOOT_REGEX, 5000)
+    assert sleeps == []
+
+    blank = cli.Rex(FakeRexRunner(screen="$ "), sleep=sleep, clock=lambda: now[0])
+    blank.wait_for_output("block:b1", cli.BOOT_REGEX, 2000)
+    assert now[0] == pytest.approx(2.0)
+
+
+def test_rex_wait_for_output_swallows_errors():
+    def failing(args):
+        return subprocess.CompletedProcess(args, 1, stdout="", stderr="gone")
+
+    cli.Rex(failing, sleep=lambda s: 1 / 0).wait_for_output("b", "x", 1000)
+
+
+def test_rex_raises_backend_error_on_failure():
+    def failing(args):
+        return subprocess.CompletedProcess(args, 4, stdout="", stderr="server unreachable")
+
+    with pytest.raises(cli.BackendError, match="server unreachable"):
+        cli.Rex(failing, git=FakeGit()).create_workspace("/x", "T")
+
+
+@pytest.fixture
+def fake_rex(installed_ct, monkeypatch):
+    """Route the Rex facade (and previews) to fakes; return a setter for them."""
+    monkeypatch.setattr(cli, "rex_available", lambda which=None: True)
+
+    def use(rex_runner=None, git=None):
+        rex_runner = rex_runner or FakeRexRunner()
+        git = git or FakeGit(PORCELAIN, REPO_R)
+        monkeypatch.setattr(cli, "default_rex_runner", rex_runner)
+        monkeypatch.setattr(cli, "default_git_runner", git)
+        return rex_runner, git
+
+    return use
+
+
+def test_space_rex_dry_run_outside_a_repo(fake_rex):
+    fake_rex()
+    result = runner.invoke(app, ["space", "DEMO", "--backend", "rex", "--cwd", "/tmp/loose", "--dry-run"])
+    assert result.exit_code == 0, result.output
+    assert "rex new DEMO --cwd /tmp/loose --window team" in result.stdout
+    assert "rex split -s <session> -b <boss> --split right --ratio 50" in result.stdout
+    assert "rex split -s <session> -b <dev> --split below --ratio 50" in result.stdout
+    assert "[boss] claude-team boss DEMO --model fable --fg" in result.stdout
+    assert "herdr" not in result.stdout
+
+
+def test_space_rex_dry_run_in_a_repo_previews_the_repo_session(fake_rex):
+    fake, _ = fake_rex()
+    result = runner.invoke(app, ["space", "DEMO", "--backend", "rex", "--cwd", "/r", "--dry-run"])
+    assert result.exit_code == 0, result.output
+    assert "window 'r' in session 'r'" in result.stdout
+    assert "rex new r --cwd /r --window r" in result.stdout
+    assert fake.calls == []  # a preview never touches rex
+
+
+def test_space_auto_picks_rex_inside_a_rex_terminal(fake_rex, monkeypatch):
+    fake_rex()
+    monkeypatch.setenv("REX_SESSION", "session:outer")
+    result = runner.invoke(app, ["space", "DEMO", "--cwd", "/tmp/loose", "--dry-run"])
+    assert "rex new DEMO" in result.stdout
+
+
+def test_space_rex_real_run_reports_session_and_teardown(fake_rex):
+    fake, _ = fake_rex()
+    result = runner.invoke(app, ["space", "DEMO", "--backend", "rex", "--cwd", "/tmp/loose", "--no-wait"])
+    assert result.exit_code == 0, result.output
+    assert "✓ session session:s1" in result.stdout
+    assert "Boss      block:b1" in result.stdout
+    assert "focus:    rex focus -s session:s1 window:w1" in result.stdout
+    assert "teardown: rex kill session:s1" in result.stdout
+    assert fake.sends()[0] == ("block:b1", "claude-team boss DEMO --model fable --fg\r")
+
+
+def test_space_rex_in_a_repo_tears_down_only_its_window(fake_rex):
+    fake_rex(FakeRexRunner(sessions=[{"session_id": "session:repo", "label": "r"}]))
+    result = runner.invoke(app, ["space", "DEMO", "--backend", "rex", "--cwd", "/r", "--no-wait"])
+    assert result.exit_code == 0, result.output
+    assert "teardown: rex window close -s session:repo window:w2" in result.stdout
+    assert "rex kill" not in result.stdout
+
+
+def test_space_requires_rex_binary(installed_ct, monkeypatch):
+    monkeypatch.setattr(cli, "default_rex_runner", lambda args: 1 / 0)
+    result = runner.invoke(app, ["space", "DEMO", "--backend", "rex"])
+    assert result.exit_code != 0
+    assert "rex not found on PATH" in result.output
+
+
+def test_worktree_rex_creates_git_worktree_then_a_window_in_the_repo_session(fake_rex, tmp_path):
+    repo = str(tmp_path / "app")
+    checkout = str(tmp_path / "app.worktrees" / "me-br")
+    fake, git = fake_rex(git=FakeGit(repos={repo: f"{repo}/.git"}))
+    result = runner.invoke(
+        app, ["worktree", "me/br", "--repo", repo, "--backend", "rex", "--no-wait"]
+    )
+    assert result.exit_code == 0, result.output
+    assert git.mutations() == [["-C", repo, "worktree", "add", "-b", "me/br", checkout, "origin/dev"]]
+    # the checkout reports its main repo, so the session is "app" and the window the branch
+    assert fake.made()[0] == cli.rex_new_argv(checkout, "app", "me-br")
+    assert "teardown: rex window close -s session:s1 window:w1" in result.stdout
+    assert f"git -C {repo} worktree remove {checkout}" in result.stdout
+    assert f"git -C {repo} branch -D me/br" in result.stdout
+
+
+def test_worktree_rex_open_starts_a_window_when_none_is_open(fake_rex):
+    fake, _ = fake_rex()
+    result = runner.invoke(
+        app, ["worktree", "me/br", "--repo", "/r", "--open", "--backend", "rex", "--no-wait"]
+    )
+    assert result.exit_code == 0, result.output
+    assert fake.made()[0] == cli.rex_new_argv("/r.worktrees/me-br", "r", "me-br")
+    assert "teardown: rex window close -s session:s1 window:w1" in result.stdout
+    assert "worktree remove" not in result.stdout
+
+
+def test_worktree_rex_open_refuses_a_window_with_a_running_team(fake_rex):
+    fake, git = fake_rex(FakeRexRunner(
+        sessions=[{"session_id": "session:repo", "label": "r"}],
+        windows=[{"window_id": "window:br", "label": "me-br"}],
+        blocks=[
+            {"block_id": "block:x", "window_id": "window:br"},
+            {"block_id": "block:y", "window_id": "window:other"},
+        ],
+    ))
+    result = runner.invoke(
+        app, ["worktree", "me/br", "--repo", "/r", "--open", "--backend", "rex", "--no-wait"]
+    )
+    assert result.exit_code == 1
+    assert "already open in session session:repo with 1 agent(s)" in result.output
+    assert "rex window close -s session:repo window:br" in result.output
+    # nothing created, typed, or changed in git before the guard fired
+    assert not fake.made() and not fake.sends() and not git.mutations()
+
+
+def test_worktree_rex_open_force_adds_a_window_beside_the_running_team(fake_rex):
+    fake, _ = fake_rex(FakeRexRunner(
+        sessions=[{"session_id": "session:repo", "label": "r"}],
+        windows=[{"window_id": "window:br", "label": "me-br"}],
+        blocks=[{"block_id": "block:x", "window_id": "window:br"}],
+    ))
+    result = runner.invoke(
+        app, ["worktree", "me/br", "--repo", "/r", "--open", "--force", "--backend", "rex", "--no-wait"]
+    )
+    assert result.exit_code == 0, result.output
+    assert fake.made() == [cli.rex_window_argv("session:repo", "/r.worktrees/me-br", "me-br")] + [
+        c for c in fake.made() if c[0] == "split"
+    ]
+    assert fake.sends()[0][0] == "block:b9"  # boss lands in the new window's block
+    # teardown closes only our window, not the earlier team's
+    assert "teardown: rex window close -s session:repo window:w2" in result.stdout
