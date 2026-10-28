@@ -21,6 +21,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
@@ -272,18 +273,22 @@ def launch_team(plans: List[LaunchPlan], dry_run: bool) -> None:
     raise typer.Exit(1 if failures else 0)
 
 
-# --- Herdr: place a team into terminal panes -----------------------------
-# Herdr (https://herdr.dev) is a terminal workspace manager for coding agents.
-# From inside a Herdr pane, the `herdr` binary drives the running session over a
-# socket and returns JSON. These helpers create a workspace (or git worktree),
-# lay panes out deterministically, and launch one role foreground per pane —
-# where each pane just re-invokes *this* CLI (reusing the LaunchPlan command
-# pattern) for a single role with `--fg`.
+# --- Multiplexers: place a team into terminal panes ----------------------
+# Two terminal multiplexers are supported, each behind its own facade:
+#   * Herdr (https://herdr.dev) — a workspace manager for coding agents. Its
+#     `herdr` binary drives the running session and returns JSON.
+#   * Rex (https://www.superlogical.com/rex) — a terminal server whose `rex`
+#     binary creates sessions, splits blocks, and types into them.
+# These helpers create a workspace / session (or git worktree), lay panes out
+# deterministically, and launch one role foreground per pane — where each pane
+# just re-invokes *this* CLI (reusing the LaunchPlan command pattern) for a
+# single role with `--fg`.
 #
 # Three patterns from the GoF catalog carry the weight here:
 #   * Strategy  — interchangeable pane-layout algorithms (`LayoutStrategy`).
-#   * Facade    — `Herdr` hides the subprocess + JSON of the `herdr` CLI behind
-#                 a few semantic operations; the commands never see either.
+#   * Facade    — `Herdr` / `Rex` hide the subprocess + JSON of their CLIs
+#                 behind the same few semantic operations; the commands never
+#                 see either, nor which multiplexer they are driving.
 #   * Command   — the per-pane launch is `claude-team <role> --fg`, which builds
 #                 and runs a `LaunchPlan` just like the standalone commands do.
 
@@ -474,7 +479,11 @@ def default_herdr_runner(args: List[str]) -> "subprocess.CompletedProcess":
     return subprocess.run(["herdr", *args], capture_output=True, text=True)
 
 
-class HerdrError(RuntimeError):
+class BackendError(RuntimeError):
+    """A multiplexer (herdr / rex) or git call failed."""
+
+
+class HerdrError(BackendError):
     """A ``herdr`` CLI call failed or returned an error payload."""
 
 
@@ -485,6 +494,10 @@ class Herdr:
     plumbing or JSON shapes. A ``runner`` is injected so tests can drive the
     facade with canned responses instead of a live herdr server.
     """
+
+    name = "herdr"
+    noun = "workspace"
+    worktree_unit = "workspace"  # what one worktree maps to
 
     def __init__(self, runner: Optional[HerdrRunner] = None) -> None:
         # Resolve the module default at call time so tests can monkeypatch it.
@@ -564,6 +577,44 @@ class Herdr:
         except HerdrError:
             pass
 
+    # Strings for previews and reports (no herdr call involved).
+    @staticmethod
+    def preview_space(cwd: str, label: str) -> List[str]:
+        return [shlex.join(["herdr", *workspace_create_argv(cwd, label)])]
+
+    @staticmethod
+    def preview_worktree(
+        repo: str, branch: str, base: str, label: str, open_existing: bool
+    ) -> List[str]:
+        argv = (
+            worktree_open_argv(repo, branch)
+            if open_existing
+            else worktree_create_argv(repo, branch, base, label)
+        )
+        return [shlex.join(["herdr", *argv])]
+
+    @staticmethod
+    def split_line(ref: str, step: SplitStep, cwd: str) -> str:
+        return "herdr " + " ".join(pane_split_argv(ref, step, cwd))
+
+    @staticmethod
+    def focus_hint(ws_id: str) -> str:
+        return f"herdr workspace focus {ws_id}"
+
+    @staticmethod
+    def close_command(ws_id: str) -> str:
+        return f"herdr workspace close {ws_id}"
+
+    def open_teardown(self, ws_id: str) -> str:
+        return self.close_command(ws_id)
+
+    @staticmethod
+    def worktree_teardown(ws_id: str, repo: str, branch: str, checkout: str) -> str:
+        return (
+            f"herdr worktree remove --workspace {ws_id}   "
+            f"# then: git -C {repo} branch -D {branch}"
+        )
+
 
 def herdr_available(which: Optional[Callable[[str], Optional[str]]] = None) -> bool:
     resolve = which or shutil.which  # resolve at call time so tests can patch it
@@ -581,9 +632,374 @@ def require_herdr(env: Mapping[str, str]) -> None:
         raise typer.BadParameter("herdr not found on PATH")
 
 
+# --- Rex: the same operations over the `rex` CLI -------------------------
+# Rex nests sessions > windows (tabs) > blocks. Inside a git repo the team is
+# filed by git: the Rex session is named after the repo (shared by every team
+# on it), the team's window after its worktree (the checkout directory's name),
+# and each role gets a block with Rex's default name. Outside a git repo a team
+# gets a session of its own. Rex has no worktree command, so worktrees are made
+# with git directly.
+REX_WINDOW = "team"
+REX_DIRECTION = {"right": "right", "down": "below"}
+
+
+def rex_new_argv(cwd: str, label: str, window: str = REX_WINDOW) -> List[str]:
+    return ["new", label, "--cwd", cwd, "--window", window, "--json"]
+
+
+def rex_window_argv(session: str, cwd: str, label: str = REX_WINDOW) -> List[str]:
+    return [
+        "window", "new", "-s", session, label, "--cwd", cwd, "--focus=false", "--json",
+    ]
+
+
+def rex_split_argv(session: str, block: str, step: SplitStep, cwd: str) -> List[str]:
+    argv = ["split", "-s", session, "-b", block, "--split", REX_DIRECTION[step.direction]]
+    if step.ratio is not None:
+        # SplitStep.ratio is the share the original keeps; rex's --ratio is the
+        # percent the *new* block gets.
+        argv += ["--ratio", str(round((1 - step.ratio) * 100))]
+    argv += ["--cwd", cwd, "--focus=false", "--json"]
+    return argv
+
+
+def rex_send_argv(session: str, block: str, command: str) -> List[str]:
+    # `rex send` types text verbatim; the trailing CR is the Enter key.
+    return ["send", "-s", session, "-b", block, command + "\r"]
+
+
+def worktree_checkout_path(repo: str, branch: str) -> str:
+    """Where a new worktree goes: ``<repo>.worktrees/<branch>`` beside the repo,
+    with ``/`` in the branch flattened so it stays one directory deep."""
+    root = Path(repo).resolve()
+    return str(root.parent / f"{root.name}.worktrees" / branch.replace("/", "-"))
+
+
+def git_worktree_add_argv(repo: str, branch: str, base: str, path: str) -> List[str]:
+    return ["-C", repo, "worktree", "add", "-b", branch, path, base]
+
+
+def find_worktree(porcelain: str, branch: str) -> Optional[str]:
+    """The checkout path for ``branch`` in ``git worktree list --porcelain``."""
+    path = None
+    for line in porcelain.splitlines():
+        if line.startswith("worktree "):
+            path = line[len("worktree "):]
+        elif line == f"branch refs/heads/{branch}":
+            return path
+    return None
+
+
+Runner = Callable[[List[str]], "subprocess.CompletedProcess"]
+
+
+def default_rex_runner(args: List[str]) -> "subprocess.CompletedProcess":
+    """Run ``rex <args>`` and capture its output (the injectable subsystem)."""
+    return subprocess.run(["rex", *args], capture_output=True, text=True)
+
+
+def default_git_runner(args: List[str]) -> "subprocess.CompletedProcess":
+    return subprocess.run(["git", *args], capture_output=True, text=True)
+
+
+def git_location(path: str, git: Optional[Runner] = None) -> Optional[Tuple[str, str]]:
+    """``(repo name, worktree name)`` for ``path``, or ``None`` outside a git
+    working tree.
+
+    The repo name comes from the *common* git dir, so a linked worktree reports
+    its main repo (``app``); the worktree name is its own checkout directory
+    (``me-br`` for ``app.worktrees/me-br``, ``app`` for the main checkout)."""
+    run = git or default_git_runner  # resolve at call time so tests can patch it
+    try:
+        proc = run([
+            "-C", path, "rev-parse", "--path-format=absolute",
+            "--git-common-dir", "--show-toplevel",
+        ])
+    except OSError:
+        return None
+    lines = proc.stdout.split("\n") if proc.returncode == 0 else []
+    if len(lines) < 2 or not lines[0].strip() or not lines[1].strip():
+        return None
+    common, toplevel = Path(lines[0].strip()), Path(lines[1].strip())
+    repo = common.parent.name if common.name == ".git" else common.name
+    return repo, toplevel.name
+
+
+class RexError(BackendError):
+    """A ``rex`` (or supporting ``git``) call failed or returned bad output."""
+
+
+class Rex:
+    """Facade over the ``rex`` CLI, mirroring :class:`Herdr` operation for
+    operation so the commands and :func:`place_team` drive either one.
+
+    Rex addresses a block within a session, so the facade remembers the session
+    and window the team lives in. ``runner`` / ``git`` / ``sleep`` / ``clock``
+    are injected so tests run without a Rex server, a repo, or real time.
+    """
+
+    name = "rex"
+    noun = "session"
+    worktree_unit = "window"  # what one worktree maps to
+
+    def __init__(
+        self,
+        runner: Optional[Runner] = None,
+        git: Optional[Runner] = None,
+        sleep: Optional[Callable[[float], None]] = None,
+        clock: Optional[Callable[[], float]] = None,
+    ) -> None:
+        # Resolve the module defaults at call time so tests can monkeypatch them.
+        self._run = runner or default_rex_runner
+        self._git = git or default_git_runner
+        self._sleep = sleep or time.sleep
+        self._clock = clock or time.monotonic
+        self.session = ""
+        self.window = ""
+        self.window_label = REX_WINDOW
+        # A team in a shared repo session is closed by its window, never by
+        # killing the session (which would take the repo's other teams too).
+        self.shared_session = False
+
+    def _text(self, tool: str, run: Runner, args: List[str]) -> str:
+        proc = run(args)
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout or "").strip()
+            raise RexError(f"`{tool} {shlex.join(args)}` failed (rc={proc.returncode}): {detail}")
+        return proc.stdout or ""
+
+    def _call(self, args: List[str]) -> dict:
+        """Run one rex command; return its JSON output, or ``{}`` if it printed
+        nothing (``send`` is silent on success)."""
+        out = self._text("rex", self._run, args)
+        if not out.strip():
+            return {}
+        try:
+            data = json.loads(out)
+        except json.JSONDecodeError:
+            raise RexError(f"`rex {shlex.join(args)}`: non-JSON output: {out[:200]!r}")
+        return data if isinstance(data, dict) else {}
+
+    def create_workspace(self, cwd: str, label: str) -> Tuple[str, str]:
+        """Make a window for a team; return ``(session_id, root_block_id)``.
+
+        In a git repo the window is named after ``cwd``'s worktree, inside the
+        repo's session (created on first use, reused after); ``label`` is not
+        used. Outside one, the team gets a session of its own named ``label``."""
+        where = git_location(cwd, self._git)
+        if where is None:
+            return self._new_session(cwd, label, REX_WINDOW)
+        repo, worktree = where
+        self.shared_session = True
+        session = self.find_session(repo)
+        if session is None:
+            return self._new_session(cwd, repo, worktree)
+        self.session = session
+        return session, self.add_window(cwd, worktree)
+
+    def _new_session(self, cwd: str, label: str, window: str) -> Tuple[str, str]:
+        r = self._call(rex_new_argv(cwd, label, window))
+        first = r["initial_windows"][0]
+        self.session, self.window = r["session_id"], first["window_id"]
+        self.window_label = window
+        return self.session, first["block_ids"][0]
+
+    def create_worktree(
+        self, repo: str, branch: str, base: str, label: str
+    ) -> Tuple[str, str, str]:
+        """``git worktree add`` a new branch, then open a session in it; return
+        ``(session_id, root_block_id, checkout_path)``."""
+        checkout = worktree_checkout_path(repo, branch)
+        self._text("git", self._git, git_worktree_add_argv(repo, branch, base, checkout))
+        session, root = self.create_workspace(checkout, label)
+        return session, root, checkout
+
+    def open_worktree(self, repo: str, branch: str) -> Tuple[str, Optional[str], str]:
+        """Find the EXISTING checkout of ``branch`` and its window (named after
+        the worktree, in the repo's session); return
+        ``(session_id, root_block_id, checkout_path)``.
+
+        Like a herdr worktree, the worktree maps to one window: if it is already
+        open, that window is the one checked for a running team and the root is
+        ``None`` — nothing is created until the caller has run that check, and
+        then :meth:`add_window` gives the new team a window of its own.
+        """
+        listing = self._text("git", self._git, ["-C", repo, "worktree", "list", "--porcelain"])
+        checkout = find_worktree(listing, branch)
+        if checkout is None:
+            raise RexError(f"no worktree of {repo} has branch {branch} checked out")
+        where = git_location(checkout, self._git)
+        session = self.find_session(where[0]) if where else None
+        window = self.find_window(session, where[1]) if session else None
+        if window is None:
+            session, root = self.create_workspace(checkout, branch)
+            return session, root, checkout
+        self.session, self.window, self.window_label = session, window, where[1]
+        self.shared_session = True
+        return session, None, checkout
+
+    def find_session(self, label: str) -> Optional[str]:
+        """The id of the first session labelled ``label``, if any."""
+        for s in self._call(["ls", "--json"]).get("sessions", []):
+            if s.get("label") == label:
+                return s["session_id"]
+        return None
+
+    def find_window(self, session: str, label: str) -> Optional[str]:
+        """The id of the first window in ``session`` labelled ``label``, if any."""
+        for w in self._call(["window", "ls", "-s", session, "--json"]).get("windows", []):
+            if w.get("label") == label:
+                return w["window_id"]
+        return None
+
+    def add_window(self, cwd: str, label: Optional[str] = None) -> str:
+        """Open a new (unfocused) window in the current session; return its block.
+
+        ``label`` defaults to the label of the window this team was matched to."""
+        self.window_label = label or self.window_label
+        r = self._call(rex_window_argv(self.session, cwd, self.window_label))
+        self.window = r["window_id"]
+        return r["block_ids"][0]
+
+    def split(self, pane: str, step: SplitStep, cwd: str) -> str:
+        """Split block ``pane`` per ``step``; return the new block's id."""
+        return self._call(rex_split_argv(self.session, pane, step, cwd))["block_ids"][0]
+
+    def run_in_pane(self, pane: str, command: str) -> None:
+        """Type ``command`` + Enter into block ``pane``'s shell."""
+        self._call(rex_send_argv(self.session, pane, command))
+
+    def agents_in_workspace(self, ws_id: str) -> List[dict]:
+        """The blocks in this team's window of ``ws_id`` (the whole session if
+        no window is known yet).
+
+        Rex does not recognize agents itself, so any terminal in a worktree's
+        window counts as its team: the window exists only to hold one. Scoping
+        to the window keeps the repo's other worktrees out of the count."""
+        blocks = self._call(["block", "ls", "-s", ws_id, "--json"]).get("blocks", [])
+        return [
+            {"pane_id": b["block_id"]}
+            for b in blocks
+            if not self.window or b.get("window_id") == self.window
+        ]
+
+    def wait_for_output(self, pane: str, regex: str, timeout_ms: int) -> None:
+        """Best-effort poll of the block's screen for ``regex``; never fatal."""
+        pattern = re.compile(regex)
+        deadline = self._clock() + timeout_ms / 1000
+        while True:
+            try:
+                screen = self._text(
+                    "rex", self._run, ["capture", "-s", self.session, "-b", pane, "--trim"]
+                )
+            except RexError:
+                return
+            if pattern.search(screen) or self._clock() >= deadline:
+                return
+            self._sleep(0.5)
+
+    # Strings for previews and reports. Previews make only read-only git calls
+    # (to name the repo session); they never touch rex.
+    @staticmethod
+    def _preview_window(cwd: str, repo: Optional[str], window: str) -> List[str]:
+        if repo is None:
+            return [shlex.join(["rex", *rex_new_argv(cwd, window)])]
+        return [
+            f"# git repo {repo!r}: window {window!r} in session {repo!r}"
+            " (rex window new, if that session is open), else:",
+            shlex.join(["rex", *rex_new_argv(cwd, repo, window)]),
+        ]
+
+    @staticmethod
+    def preview_space(cwd: str, label: str) -> List[str]:
+        where = git_location(cwd)
+        if where is None:
+            return Rex._preview_window(cwd, None, label)
+        return Rex._preview_window(cwd, *where)
+
+    @staticmethod
+    def preview_worktree(
+        repo: str, branch: str, base: str, label: str, open_existing: bool
+    ) -> List[str]:
+        # Before the checkout exists, name the session from the repo itself.
+        where = git_location(repo)
+        repo_name = where[0] if where else Path(repo).resolve().name
+        if open_existing:
+            return [
+                f"git -C {shlex.quote(repo)} worktree list --porcelain"
+                f"   # find {branch}'s <checkout>",
+                f"# reuse the <checkout>'s window in session {repo_name!r} if open, else:",
+                *Rex._preview_window("<checkout>", repo_name, "<checkout name>")[1:],
+            ]
+        checkout = worktree_checkout_path(repo, branch)
+        return [
+            shlex.join(["git", *git_worktree_add_argv(repo, branch, base, checkout)]),
+            *Rex._preview_window(checkout, repo_name, Path(checkout).name),
+        ]
+
+    @staticmethod
+    def split_line(ref: str, step: SplitStep, cwd: str) -> str:
+        return "rex " + " ".join(rex_split_argv("<session>", ref, step, cwd))
+
+    def focus_hint(self, ws_id: str) -> str:
+        return f"rex focus -s {ws_id} {self.window}"
+
+    def close_command(self, ws_id: str) -> str:
+        if self.shared_session:
+            return f"rex window close -s {ws_id} {self.window}"
+        return f"rex kill {ws_id}"
+
+    def open_teardown(self, ws_id: str) -> str:
+        return self.close_command(ws_id)
+
+    def worktree_teardown(self, ws_id: str, repo: str, branch: str, checkout: str) -> str:
+        return (
+            f"{self.close_command(ws_id)}   # then: git -C {repo} worktree remove {checkout}"
+            f" && git -C {repo} branch -D {branch}"
+        )
+
+
+def rex_available(which: Optional[Callable[[str], Optional[str]]] = None) -> bool:
+    resolve = which or shutil.which  # resolve at call time so tests can patch it
+    return resolve("rex") is not None
+
+
+def require_rex() -> None:
+    """Guard: rex reaches its server from any terminal, so only the binary is needed."""
+    if not rex_available():
+        raise typer.BadParameter("rex not found on PATH")
+
+
+# --- Backend selection ---------------------------------------------------
+BACKENDS = {"herdr": Herdr, "rex": Rex}
+
+
+def resolve_backend(choice: str, env: Mapping[str, str]) -> str:
+    """Resolve ``--backend``. ``auto`` picks the multiplexer we are running in:
+    herdr if ``HERDR_ENV=1``, rex if ``REX_SESSION`` is set, else herdr."""
+    if choice == "auto":
+        if env.get("HERDR_ENV") == "1":
+            return "herdr"
+        return "rex" if env.get("REX_SESSION") else "herdr"
+    if choice not in BACKENDS:
+        raise typer.BadParameter(
+            f"unknown backend {choice!r}; choose from auto, {', '.join(BACKENDS)}"
+        )
+    return choice
+
+
+def open_backend(name: str):
+    """Check the backend is usable here, then return a live facade for it."""
+    if name == "rex":
+        require_rex()
+        return Rex()
+    require_herdr(os.environ)
+    return Herdr()
+
+
 # --- Director: split panes, launch a role in each ------------------------
 def place_team(
-    herdr: Herdr,
+    mux,
     layout: LayoutStrategy,
     root_pane: str,
     cwd: str,
@@ -596,22 +1012,23 @@ def place_team(
 ) -> List[Tuple[Role, str]]:
     """Grow ``root_pane`` into the layout, then launch one role per pane.
 
-    Roles arrive in canonical order (boss first), and pane 0 is the root, so the
-    boss is always launched first — the dev/qa "check in with boss" prompt lands
-    on a live session. ``prompts`` / ``models`` override a role's opening prompt /
-    model by role.
+    ``mux`` is a :class:`Herdr` or :class:`Rex` facade. Roles arrive in
+    canonical order (boss first), and pane 0 is the root, so the boss is always
+    launched first — the dev/qa "check in with boss" prompt lands on a live
+    session. ``prompts`` / ``models`` override a role's opening prompt / model
+    by role.
     """
     prompts = prompts or {}
     models = models or {}
     panes = [root_pane]
     for step in layout.plan(len(roles)):
-        panes.append(herdr.split(panes[step.source], step, cwd))
+        panes.append(mux.split(panes[step.source], step, cwd))
     placements = list(zip(roles, panes))
     for role, pane in placements:
         cmd = pane_launch_command(
             invocation, role, topic, suffix, prompts.get(role), models.get(role)
         )
-        herdr.run_in_pane(pane, cmd)
+        mux.run_in_pane(pane, cmd)
     return placements
 
 
@@ -624,6 +1041,7 @@ def preview_placement(
     cwd: str,
     prompts: Optional[Mapping[Role, str]] = None,
     models: Optional[Mapping[Role, str]] = None,
+    split_line: Callable[[str, SplitStep, str], str] = Herdr.split_line,
 ) -> List[str]:
     """Human-readable dry-run of the splits + per-pane launches (no pane ids yet)."""
     prompts = prompts or {}
@@ -632,7 +1050,7 @@ def preview_placement(
     refs = [f"<{tokens[0]}>"]
     lines = [f"# layout: {layout.name}, {len(roles)} pane(s)"]
     for idx, step in enumerate(layout.plan(len(roles)), start=1):
-        lines.append("herdr " + " ".join(pane_split_argv(refs[step.source], step, cwd)))
+        lines.append(split_line(refs[step.source], step, cwd))
         refs.append(f"<{tokens[idx]}>")
     lines.append("# per-pane launch (foreground):")
     for role in roles:
@@ -644,7 +1062,7 @@ def preview_placement(
 
 
 def report_team(
-    herdr: Herdr,
+    mux,
     ws_id: str,
     placements: List[Tuple[Role, str]],
     wait: bool,
@@ -653,24 +1071,26 @@ def report_team(
 ) -> None:
     """Print the created workspace, pane→role map, live status, and next steps."""
     if wait and placements:
-        herdr.wait_for_output(placements[0][1], BOOT_REGEX, 20000)
+        mux.wait_for_output(placements[0][1], BOOT_REGEX, 20000)
     statuses: dict = {}
     if wait:
         try:
+            # Only herdr reports an agent status; rex blocks carry none.
             statuses = {
-                a["pane_id"]: a.get("agent_status", "?")
-                for a in herdr.agents_in_workspace(ws_id)
+                a["pane_id"]: a["agent_status"]
+                for a in mux.agents_in_workspace(ws_id)
+                if "agent_status" in a
             }
-        except HerdrError:
+        except BackendError:
             statuses = {}
 
-    typer.echo(f"✓ workspace {ws_id}")
+    typer.echo(f"✓ {mux.noun} {ws_id}")
     if extra:
         typer.echo(f"  {extra}")
     for role, pane in placements:
         stag = f"  [{statuses[pane]}]" if pane in statuses else ""
         typer.echo(f"  {role.label:9} {pane}{stag}")
-    typer.echo(f"  focus:    herdr workspace focus {ws_id}")
+    typer.echo(f"  focus:    {mux.focus_hint(ws_id)}")
     typer.echo(f"  teardown: {teardown}")
 
 
@@ -719,9 +1139,15 @@ def detect_state(
     provider = agents_provider or fetch_agents
     agents = provider()
     background = decide_background(None, env, isatty)
+    detected = {"herdr": env.get("HERDR_ENV") == "1", "rex": bool(env.get("REX_SESSION"))}
     return {
         "claude_cli": shutil.which("claude"),
         "claude_team_cli": shutil.which("claude-team"),
+        "herdr_cli": shutil.which("herdr"),
+        "rex_cli": shutil.which("rex"),
+        # The terminal multiplexer this shell runs in (what `--backend auto`
+        # targets), or None when neither is detected.
+        "multiplexer": resolve_backend("auto", env) if any(detected.values()) else None,
         "launch_context": "background" if background else "foreground",
         "in_claude_session": "CLAUDECODE" in env,
         "isatty": isatty,
@@ -854,9 +1280,20 @@ LayoutOpt = typer.Option(
     DEFAULT_LAYOUT, "--layout", help=f"Pane layout. Choices: {', '.join(LAYOUTS)}."
 )
 CwdOpt = typer.Option(None, "--cwd", help="Working dir for the panes (default: current dir).")
-LabelOpt = typer.Option(None, "--label", help="Workspace label (default: the topic / branch).")
+LabelOpt = typer.Option(
+    None,
+    "--label",
+    help="Workspace label (default: the topic / branch). Not used by rex in a "
+    "git repo, where the window takes the worktree's name.",
+)
 WaitOpt = typer.Option(
     True, "--wait/--no-wait", help="Wait for the boss to boot, then report agent status."
+)
+BackendOpt = typer.Option(
+    "auto",
+    "--backend",
+    help="Terminal multiplexer: herdr, rex, or auto (the one this terminal runs "
+    "in; herdr if neither is detected).",
 )
 BossPromptOpt = typer.Option(
     None,
@@ -920,12 +1357,14 @@ def space(
     boss_model: str = BossModelOpt,
     dev_model: str = DevModelOpt,
     qa_model: str = QaModelOpt,
+    backend: str = BackendOpt,
     wait: bool = WaitOpt,
     dry_run: bool = DryRunOpt,
 ) -> None:
-    """Create a Herdr workspace (one tab) and launch a role per pane in it."""
+    """Create a Herdr workspace / Rex session (one tab) and launch a role per pane in it."""
     selected = parse_roles(roles)
     strategy = get_layout(layout)
+    kind = BACKENDS[resolve_backend(backend, os.environ)]
     work_cwd = cwd or os.getcwd()
     ws_label = (label or topic).strip()
     invocation = claude_team_invocation()
@@ -933,22 +1372,25 @@ def space(
     models = role_models(boss_model, dev_model, qa_model)
 
     if dry_run:
-        typer.echo(shlex.join(["herdr", *workspace_create_argv(work_cwd, ws_label)]))
-        for line in preview_placement(strategy, selected, topic, suffix, invocation, work_cwd, prompts, models):
+        for line in kind.preview_space(work_cwd, ws_label):
+            typer.echo(line)
+        for line in preview_placement(
+            strategy, selected, topic, suffix, invocation, work_cwd, prompts, models,
+            split_line=kind.split_line,
+        ):
             typer.echo(line)
         raise typer.Exit()
 
-    require_herdr(os.environ)
-    herdr = Herdr()
+    mux = open_backend(kind.name)
     try:
-        ws_id, root_pane = herdr.create_workspace(work_cwd, ws_label)
+        ws_id, root_pane = mux.create_workspace(work_cwd, ws_label)
         placements = place_team(
-            herdr, strategy, root_pane, work_cwd, selected, topic, suffix, invocation, prompts, models
+            mux, strategy, root_pane, work_cwd, selected, topic, suffix, invocation, prompts, models
         )
-    except HerdrError as exc:
+    except BackendError as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(1)
-    report_team(herdr, ws_id, placements, wait, teardown=f"herdr workspace close {ws_id}")
+    report_team(mux, ws_id, placements, wait, teardown=mux.close_command(ws_id))
 
 
 @app.command()
@@ -963,9 +1405,9 @@ def worktree(
     open_existing: bool = typer.Option(
         False,
         "--open",
-        help="Open an EXISTING worktree for BRANCH (herdr worktree open) and nest "
-        "the team under it, instead of creating a new branch. --base and --label "
-        "are ignored (the worktree keeps its own label).",
+        help="Open an EXISTING worktree for BRANCH (herdr worktree open, or its "
+        "rex session) and nest the team under it, instead of creating a new "
+        "branch. --base and --label are ignored (the worktree keeps its own label).",
     ),
     force: bool = typer.Option(
         False,
@@ -986,19 +1428,21 @@ def worktree(
     boss_model: str = BossModelOpt,
     dev_model: str = DevModelOpt,
     qa_model: str = QaModelOpt,
+    backend: str = BackendOpt,
     wait: bool = WaitOpt,
     dry_run: bool = DryRunOpt,
 ) -> None:
     """Create (or, with --open, reuse an existing) git worktree and launch a team on it.
 
-    A git worktree maps to a single Herdr workspace, so --open on a worktree that
-    already has a team reuses that workspace; the guard refuses to add a second
+    A git worktree maps to a single Herdr workspace / Rex session, so --open on a
+    worktree that already has a team reuses it; the guard refuses to add a second
     team into it unless --force is given.
     """
     if not branch.strip():
         raise typer.BadParameter("BRANCH must not be empty.")
     selected = parse_roles(roles)
     strategy = get_layout(layout)
+    kind = BACKENDS[resolve_backend(backend, os.environ)]
     repo_path = repo or os.getcwd()
     team_topic = (topic or branch).strip()
     ws_label = (label or branch).strip()
@@ -1006,53 +1450,51 @@ def worktree(
     prompts = role_prompts(selected, boss_prompt, dev_prompt, qa_prompt)
     models = role_models(boss_model, dev_model, qa_model)
 
-    create_argv = (
-        worktree_open_argv(repo_path, branch)
-        if open_existing
-        else worktree_create_argv(repo_path, branch, base, ws_label)
-    )
     if dry_run:
-        typer.echo(shlex.join(["herdr", *create_argv]))
-        for line in preview_placement(strategy, selected, team_topic, suffix, invocation, "<checkout>", prompts, models):
+        for line in kind.preview_worktree(repo_path, branch, base, ws_label, open_existing):
+            typer.echo(line)
+        for line in preview_placement(
+            strategy, selected, team_topic, suffix, invocation, "<checkout>", prompts, models,
+            split_line=kind.split_line,
+        ):
             typer.echo(line)
         raise typer.Exit()
 
-    require_herdr(os.environ)
-    herdr = Herdr()
+    mux = open_backend(kind.name)
     try:
         if open_existing:
-            ws_id, root_pane, checkout = herdr.open_worktree(repo_path, branch)
+            ws_id, root_pane, checkout = mux.open_worktree(repo_path, branch)
             if not force:
-                existing = herdr.agents_in_workspace(ws_id)
+                existing = mux.agents_in_workspace(ws_id)
                 if existing:
                     typer.echo(
-                        f"error: worktree {branch} is already open in workspace {ws_id} "
-                        f"with {len(existing)} agent(s). A worktree maps to one workspace, "
+                        f"error: worktree {branch} is already open in {mux.noun} {ws_id} "
+                        f"with {len(existing)} agent(s). A worktree maps to one {mux.worktree_unit}, "
                         f"so this would add a team into the running one. Close it first "
-                        f"(herdr workspace close {ws_id}) or pass --force.",
+                        f"({mux.close_command(ws_id)}) or pass --force.",
                         err=True,
                     )
                     raise typer.Exit(1)
+            if root_pane is None:
+                # Rex reused the worktree's open session: give this team a window.
+                root_pane = mux.add_window(checkout or repo_path)
         else:
-            ws_id, root_pane, checkout = herdr.create_worktree(repo_path, branch, base, ws_label)
+            ws_id, root_pane, checkout = mux.create_worktree(repo_path, branch, base, ws_label)
         placements = place_team(
-            herdr, strategy, root_pane, checkout or repo_path, selected, team_topic, suffix, invocation, prompts, models
+            mux, strategy, root_pane, checkout or repo_path, selected, team_topic, suffix, invocation, prompts, models
         )
-    except HerdrError as exc:
+    except BackendError as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(1)
     if open_existing:
         # We opened a pre-existing worktree; teardown only closes the workspace,
         # it must not remove the checkout or delete the branch.
-        teardown = f"herdr workspace close {ws_id}"
+        teardown = mux.open_teardown(ws_id)
         extra = f"opened existing worktree {branch}  ->  {checkout or '(worktree)'}"
     else:
-        teardown = (
-            f"herdr worktree remove --workspace {ws_id}   "
-            f"# then: git -C {repo_path} branch -D {branch}"
-        )
+        teardown = mux.worktree_teardown(ws_id, repo_path, branch, checkout)
         extra = f"branch {branch} @ {base}  ->  {checkout or '(worktree)'}"
-    report_team(herdr, ws_id, placements, wait, teardown=teardown, extra=extra)
+    report_team(mux, ws_id, placements, wait, teardown=teardown, extra=extra)
 
 
 def render_quickstart(state: dict) -> str:
@@ -1074,6 +1516,19 @@ def render_quickstart(state: dict) -> str:
             f"({t['boss']} boss / {t['developer']} developer / {t['qa']} qa)"
         )
 
+    mux = state["multiplexer"]
+    if mux:
+        multiplexer = (
+            f"[info]    multiplexer - in {mux}: space/worktree lay teams out there"
+            f" ({mux} on PATH: {bool(state[f'{mux}_cli'])})"
+        )
+    else:
+        multiplexer = (
+            "[info]    multiplexer - none detected (no HERDR_ENV / REX_SESSION):"
+            " space/worktree need --backend rex (works from any terminal) or a"
+            " Herdr pane; `team` needs neither"
+        )
+
     lines = [
         "# claude-team setup",
         "",
@@ -1085,6 +1540,7 @@ def render_quickstart(state: dict) -> str:
               "claude-team on PATH", "uv tool install ."),
         f"[info]    launch_context - launches {state['launch_context']} "
         f"(tty={state['isatty']}, in_claude_session={state['in_claude_session']})",
+        multiplexer,
         active,
         "",
         "## How claude-team works",
@@ -1124,7 +1580,8 @@ def render_quickstart(state: dict) -> str:
         "claude-team qa   PROJ-123 --bg",
         "```",
         "",
-        "In a Herdr pane, lay the team out in panes and give each role its own"
+        "In a Herdr pane or a Rex terminal (auto-detected; force with --backend"
+        " herdr|rex), lay the team out in panes and give each role its own"
         " opening prompt (omit a flag to keep that role's default — boss: none,"
         ' dev/qa: "Check in with boss"):',
         "```",
@@ -1139,11 +1596,22 @@ def render_quickstart(state: dict) -> str:
         "dev/qa still check in with the boss even with a custom prompt: the check-in"
         " rides along as --append-system-prompt so a leading slash command stays intact.",
         "",
+        "In Rex, a git repo's teams are organized by git: the Rex session is named"
+        " after the repo, each worktree gets a window named after its checkout"
+        " directory (`me/proj-1` -> `<repo>.worktrees/me-proj-1` -> window"
+        " `me-proj-1`), and each role a terminal block (Boss on the left)."
+        " Closing a window ends that team and leaves the worktree on disk; run the"
+        " printed teardown to remove it. `--open` refuses a worktree whose window"
+        " already has terminals unless `--force`.",
+        "",
         "Find and reach sessions:",
         "```",
         "claude agents --json             # every session (interactive + background)",
         "claude attach <id>               # background sessions only",
         "claude --resume <session-id>     # foreground sessions: new run, once idle",
+        "rex ls                           # Rex: one session per repo",
+        "rex window ls -s <repo>          # Rex: one window per worktree",
+        "rex focus -s <repo> <worktree>   # Rex: show a worktree's team",
         "```",
     ]
     return "\n".join(lines)
