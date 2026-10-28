@@ -1139,9 +1139,15 @@ def detect_state(
     provider = agents_provider or fetch_agents
     agents = provider()
     background = decide_background(None, env, isatty)
+    detected = {"herdr": env.get("HERDR_ENV") == "1", "rex": bool(env.get("REX_SESSION"))}
     return {
         "claude_cli": shutil.which("claude"),
         "claude_team_cli": shutil.which("claude-team"),
+        "herdr_cli": shutil.which("herdr"),
+        "rex_cli": shutil.which("rex"),
+        # The terminal multiplexer this shell runs in (what `--backend auto`
+        # targets), or None when neither is detected.
+        "multiplexer": resolve_backend("auto", env) if any(detected.values()) else None,
         "launch_context": "background" if background else "foreground",
         "in_claude_session": "CLAUDECODE" in env,
         "isatty": isatty,
@@ -1510,6 +1516,19 @@ def render_quickstart(state: dict) -> str:
             f"({t['boss']} boss / {t['developer']} developer / {t['qa']} qa)"
         )
 
+    mux = state["multiplexer"]
+    if mux:
+        multiplexer = (
+            f"[info]    multiplexer - in {mux}: space/worktree lay teams out there"
+            f" ({mux} on PATH: {bool(state[f'{mux}_cli'])})"
+        )
+    else:
+        multiplexer = (
+            "[info]    multiplexer - none detected (no HERDR_ENV / REX_SESSION):"
+            " space/worktree need --backend rex (works from any terminal) or a"
+            " Herdr pane; `team` needs neither"
+        )
+
     lines = [
         "# claude-team setup",
         "",
@@ -1521,6 +1540,7 @@ def render_quickstart(state: dict) -> str:
               "claude-team on PATH", "uv tool install ."),
         f"[info]    launch_context - launches {state['launch_context']} "
         f"(tty={state['isatty']}, in_claude_session={state['in_claude_session']})",
+        multiplexer,
         active,
         "",
         "## How claude-team works",
@@ -1576,11 +1596,22 @@ def render_quickstart(state: dict) -> str:
         "dev/qa still check in with the boss even with a custom prompt: the check-in"
         " rides along as --append-system-prompt so a leading slash command stays intact.",
         "",
+        "In Rex, a git repo's teams are organized by git: the Rex session is named"
+        " after the repo, each worktree gets a window named after its checkout"
+        " directory (`me/proj-1` -> `<repo>.worktrees/me-proj-1` -> window"
+        " `me-proj-1`), and each role a terminal block (Boss on the left)."
+        " Closing a window ends that team and leaves the worktree on disk; run the"
+        " printed teardown to remove it. `--open` refuses a worktree whose window"
+        " already has terminals unless `--force`.",
+        "",
         "Find and reach sessions:",
         "```",
         "claude agents --json             # every session (interactive + background)",
         "claude attach <id>               # background sessions only",
         "claude --resume <session-id>     # foreground sessions: new run, once idle",
+        "rex ls                           # Rex: one session per repo",
+        "rex window ls -s <repo>          # Rex: one window per worktree",
+        "rex focus -s <repo> <worktree>   # Rex: show a worktree's team",
         "```",
     ]
     return "\n".join(lines)

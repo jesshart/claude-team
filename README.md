@@ -321,8 +321,10 @@ claude-team quickstart --json      # detected state only, for scripting
 ```
 
 It reports whether `claude` / `claude-team` are on PATH, whether this context
-launches foreground or background, and a live snapshot of running team sessions
-(from `claude agents --json`).
+launches foreground or background, which multiplexer (Herdr or Rex) this
+terminal runs in, and a live snapshot of running team sessions (from
+`claude agents --json`). Its playbook covers the Rex layout and the `rex`
+commands for finding a team.
 
 ## Roles
 

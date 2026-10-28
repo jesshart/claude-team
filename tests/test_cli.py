@@ -1421,3 +1421,35 @@ def test_worktree_rex_open_force_adds_a_window_beside_the_running_team(fake_rex)
     assert fake.sends()[0][0] == "block:b9"  # boss lands in the new window's block
     # teardown closes only our window, not the earlier team's
     assert "teardown: rex window close -s session:repo window:w2" in result.stdout
+
+
+# --- quickstart: multiplexer detection ------------------------------------
+def test_detect_state_reports_the_multiplexer(monkeypatch):
+    monkeypatch.setattr(cli.shutil, "which", lambda name: f"/usr/bin/{name}")
+    none = lambda: []  # noqa: E731
+    assert detect_state({"REX_SESSION": "session:x"}, True, none)["multiplexer"] == "rex"
+    assert detect_state({"HERDR_ENV": "1"}, True, none)["multiplexer"] == "herdr"
+    assert detect_state({}, True, none)["multiplexer"] is None
+    assert detect_state({}, True, none)["rex_cli"] == "/usr/bin/rex"
+
+
+def test_quickstart_guide_explains_rex_layout_and_lookup(monkeypatch):
+    monkeypatch.setattr(cli.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(cli, "fetch_agents", lambda: [])
+    monkeypatch.setenv("REX_SESSION", "session:x")
+    monkeypatch.delenv("HERDR_ENV", raising=False)
+    result = runner.invoke(app, ["quickstart"])
+    assert result.exit_code == 0
+    assert "multiplexer - in rex" in result.stdout
+    assert "Rex session is named after the repo" in result.stdout
+    assert "rex window ls -s <repo>" in result.stdout
+
+
+def test_quickstart_guide_without_a_multiplexer_points_at_backend_flag(monkeypatch):
+    monkeypatch.setattr(cli.shutil, "which", lambda name: None)
+    monkeypatch.setattr(cli, "fetch_agents", lambda: None)
+    monkeypatch.delenv("REX_SESSION", raising=False)
+    monkeypatch.delenv("HERDR_ENV", raising=False)
+    result = runner.invoke(app, ["quickstart"])
+    assert "multiplexer - none detected" in result.stdout
+    assert "--backend rex" in result.stdout
