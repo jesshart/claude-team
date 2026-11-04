@@ -686,9 +686,13 @@ def git_worktree_add_argv(repo: str, branch: str, base: str, path: str) -> List[
 
 
 def find_worktree(porcelain: str, branch: str) -> Optional[str]:
-    """The checkout path for ``branch`` in ``git worktree list --porcelain``."""
+    """The checkout path for ``branch`` in ``git worktree list --porcelain``.
+
+    Accepts ``-z`` output (NUL-separated fields), which keeps a path with a
+    newline in it whole; line-separated output would cut it short."""
     path = None
-    for line in porcelain.splitlines():
+    fields = porcelain.split("\0") if "\0" in porcelain else porcelain.splitlines()
+    for line in fields:
         if line.startswith("worktree "):
             path = line[len("worktree "):]
         elif line == f"branch refs/heads/{branch}":
@@ -705,7 +709,7 @@ def locate_worktree(repo: str, branch: str, git: Optional[Runner] = None) -> str
     Read-only (``git worktree list``), so ``--open`` can check the folder for a
     running team before it asks a multiplexer to open or create anything."""
     run = git or default_git_runner  # resolve at call time so tests can patch it
-    args = ["-C", repo, "worktree", "list", "--porcelain"]
+    args = ["-C", repo, "worktree", "list", "--porcelain", "-z"]
     try:
         proc = run(args)
     except OSError as exc:

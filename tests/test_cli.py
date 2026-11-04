@@ -855,6 +855,14 @@ def test_worktree_open_errors_when_the_branch_has_no_worktree(fake_herdr):
 
 
 # --- live-session check: which sessions count as "in this folder" ---------
+def test_find_worktree_keeps_a_newline_in_the_path_with_z_output():
+    # `git worktree list --porcelain` does not quote paths; a newline would cut
+    # the path short. With -z, fields are NUL-separated and the path stays whole.
+    z = "worktree /r\0HEAD a\0branch refs/heads/main\0\0worktree /w\nnl\0HEAD b\0branch refs/heads/me/br\0\0"
+    assert cli.find_worktree(z, "me/br") == "/w\nnl"
+    assert cli.find_worktree(z, "main") == "/r"
+
+
 def test_path_within_matches_the_folder_and_its_subfolders_only(tmp_path):
     co = tmp_path / "app.worktrees" / "me-br"
     (co / "src").mkdir(parents=True)
