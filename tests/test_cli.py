@@ -699,6 +699,29 @@ def installed_ct(monkeypatch):
         cli.shutil, "which",
         lambda name: "/opt/bin/claude-team" if name == "claude-team" else None,
     )
+    # `claude agents` reports no live sessions unless a test says otherwise.
+    monkeypatch.setattr(cli, "fetch_agents", lambda: [])
+
+
+@pytest.fixture
+def fake_herdr(installed_ct, monkeypatch):
+    """A live-looking Herdr session over a fake runner; `git worktree list`
+    answers from PORCELAIN (branch me/br is checked out at /r.worktrees/me-br)."""
+    monkeypatch.setenv("HERDR_ENV", "1")
+    monkeypatch.setattr(cli, "herdr_available", lambda which=None: True)
+    monkeypatch.setattr(cli, "default_git_runner", FakeGit(PORCELAIN, REPO_R))
+
+    def use(fake=None):
+        fake = fake or FakeHerdrRunner()
+        monkeypatch.setattr(cli, "default_herdr_runner", fake)
+        return fake
+
+    return use
+
+
+def live(*sessions):
+    """A `claude agents --json` reply: ``(name, cwd)`` pairs as live sessions."""
+    return lambda: [{"kind": "interactive", "name": n, "cwd": c} for n, c in sessions]
 
 
 def test_space_dry_run_previews_workspace_and_launches(installed_ct):
@@ -762,63 +785,100 @@ def test_space_real_run_reports_workspace_and_panes(installed_ct, monkeypatch):
     assert fake.pane_runs()[0] == ("w1:p1", "claude-team boss DEMO --model fable --fg")
 
 
-def test_worktree_open_real_run_reports_and_uses_workspace_teardown(installed_ct, monkeypatch):
-    fake = FakeHerdrRunner()
-    monkeypatch.setenv("HERDR_ENV", "1")
-    monkeypatch.setattr(cli, "default_herdr_runner", fake)
-    monkeypatch.setattr(cli, "herdr_available", lambda which=None: True)
+def test_worktree_open_real_run_reports_and_uses_workspace_teardown(fake_herdr):
+    fake = fake_herdr()
 
     result = runner.invoke(
-        app, ["worktree", "me/proj-123-resume", "--repo", "/r", "--open", "--no-wait"]
+        app, ["worktree", "me/br", "--repo", "/r", "--open", "--no-wait"]
     )
     assert result.exit_code == 0, result.output
     assert "✓ workspace w3" in result.stdout
-    assert "opened existing worktree me/proj-123-resume" in result.stdout
+    assert "opened existing worktree me/br" in result.stdout
     # teardown closes the workspace only — never removes the pre-existing worktree/branch
     assert "teardown: herdr workspace close w3" in result.stdout
     assert "worktree remove" not in result.stdout
     # panes launched in the opened worktree's checkout
-    assert fake.pane_runs()[0] == ("w3:p1", "claude-team boss me/proj-123-resume --model fable --fg")
+    assert fake.pane_runs()[0] == ("w3:p1", "claude-team boss me/br --model fable --fg")
 
 
-def test_worktree_open_refuses_when_workspace_already_has_agents(installed_ct, monkeypatch):
-    class OccupiedRunner(FakeHerdrRunner):
-        def _result(self, args):
-            if args[:2] == ["agent", "list"]:
-                return {"agents": [{"pane_id": "w3:p1", "workspace_id": "w3"}]}
-            return super()._result(args)
+def test_worktree_open_refuses_while_a_claude_session_works_in_the_checkout(fake_herdr, monkeypatch):
+    fake = fake_herdr()
+    monkeypatch.setattr(cli, "fetch_agents", live(
+        ("Boss: me/br", "/r.worktrees/me-br"), ("Developer: me/br", "/r.worktrees/me-br/src"),
+    ))
 
-    fake = OccupiedRunner()
-    monkeypatch.setenv("HERDR_ENV", "1")
-    monkeypatch.setattr(cli, "default_herdr_runner", fake)
-    monkeypatch.setattr(cli, "herdr_available", lambda which=None: True)
-
-    result = runner.invoke(app, ["worktree", "br", "--repo", "/r", "--open", "--no-wait"])
+    result = runner.invoke(app, ["worktree", "me/br", "--repo", "/r", "--open", "--no-wait"])
     assert result.exit_code == 1
-    assert "already open in workspace w3" in result.output
+    assert "a team is already working in worktree me/br (/r.worktrees/me-br)" in result.output
+    assert "  Boss: me/br" in result.output and "  Developer: me/br" in result.output
+    assert "Go to it: herdr worktree open --cwd /r --branch me/br" in result.output
     assert "--force" in result.output
-    # guard fires before any pane is launched
-    assert not [c for c in fake.calls if c[:2] == ["pane", "split"]]
-    assert not fake.pane_runs()
+    # the check runs before herdr is asked to open (or create) anything
+    assert fake.calls == []
 
 
-def test_worktree_open_force_launches_into_occupied_workspace(installed_ct, monkeypatch):
-    class OccupiedRunner(FakeHerdrRunner):
-        def _result(self, args):
-            if args[:2] == ["agent", "list"]:
-                return {"agents": [{"pane_id": "w3:p1", "workspace_id": "w3"}]}
-            return super()._result(args)
+def test_worktree_open_ignores_sessions_in_other_folders(fake_herdr, monkeypatch):
+    fake = fake_herdr()
+    monkeypatch.setattr(cli, "fetch_agents", live(
+        ("Boss: other", "/r.worktrees/me-br2"), ("Boss: main", "/r"),
+    ))
+    result = runner.invoke(app, ["worktree", "me/br", "--repo", "/r", "--open", "--no-wait"])
+    assert result.exit_code == 0, result.output
+    assert fake.pane_runs()
 
-    fake = OccupiedRunner()
-    monkeypatch.setenv("HERDR_ENV", "1")
-    monkeypatch.setattr(cli, "default_herdr_runner", fake)
-    monkeypatch.setattr(cli, "herdr_available", lambda which=None: True)
 
+def test_worktree_open_force_launches_beside_a_running_team(fake_herdr, monkeypatch):
+    fake = fake_herdr()
+    monkeypatch.setattr(cli, "fetch_agents", live(("Boss: me/br", "/r.worktrees/me-br")))
     result = runner.invoke(
-        app, ["worktree", "br", "--repo", "/r", "--open", "--force", "--no-wait"]
+        app, ["worktree", "me/br", "--repo", "/r", "--open", "--force", "--no-wait"]
     )
     assert result.exit_code == 0, result.output
-    assert fake.pane_runs()  # --force bypasses the guard and launches
+    assert fake.pane_runs()  # --force skips the check and launches
+
+
+def test_worktree_open_warns_and_launches_when_claude_agents_fails(fake_herdr, monkeypatch):
+    fake = fake_herdr()
+    monkeypatch.setattr(cli, "fetch_agents", lambda: None)
+    result = runner.invoke(app, ["worktree", "me/br", "--repo", "/r", "--open", "--no-wait"])
+    assert result.exit_code == 0, result.output
+    assert "couldn't check for a running team" in result.output
+    assert fake.pane_runs()
+
+
+def test_worktree_open_errors_when_the_branch_has_no_worktree(fake_herdr):
+    fake = fake_herdr()
+    result = runner.invoke(app, ["worktree", "nope", "--repo", "/r", "--open", "--no-wait"])
+    assert result.exit_code == 1
+    assert "no worktree of /r has branch nope checked out" in result.output
+    assert fake.calls == []
+
+
+# --- live-session check: which sessions count as "in this folder" ---------
+def test_path_within_matches_the_folder_and_its_subfolders_only(tmp_path):
+    co = tmp_path / "app.worktrees" / "me-br"
+    (co / "src").mkdir(parents=True)
+    (tmp_path / "app.worktrees" / "me-br2").mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(co)
+    assert cli.path_within(str(co), str(co))
+    assert cli.path_within(str(co / "src"), str(co))
+    assert cli.path_within(str(link), str(co))  # compared as real paths
+    assert not cli.path_within(str(tmp_path / "app.worktrees" / "me-br2"), str(co))
+    assert not cli.path_within(str(tmp_path), str(co))
+
+
+def test_live_sessions_in_counts_every_listed_session_in_the_folder():
+    agents = [
+        {"name": "Boss: x", "kind": "interactive", "cwd": "/r.worktrees/me-br"},
+        # a background session that finished its turn is idle, still alive
+        {"name": "Developer: x", "kind": "background", "state": "done", "cwd": "/r.worktrees/me-br/a"},
+        {"name": "Boss: y", "kind": "interactive", "cwd": "/r.worktrees/other"},
+        {"name": "no cwd", "kind": "background"},
+    ]
+    assert [a["name"] for a in cli.live_sessions_in("/r.worktrees/me-br", agents)] == [
+        "Boss: x", "Developer: x",
+    ]
 
 
 # --- prompt overrides: boss --prompt / space|worktree per-role prompts ----
@@ -1095,17 +1155,24 @@ class FakeRexRunner:
         stdout = out if isinstance(out, str) else (json.dumps(out) if out else "")
         return subprocess.CompletedProcess(args, 0, stdout=stdout, stderr="")
 
+    def _made_block(self, block_id, window_id):
+        # Like real rex, `block ls` lists every block that was created.
+        self.blocks.append({"block_id": block_id, "window_id": window_id})
+        return block_id
+
     def _result(self, args):
         if args[0] == "new":
             return {"session_id": "session:s1", "initial_windows": [
-                {"window_id": "window:w1", "block_ids": ["block:b1"]}]}
+                {"window_id": "window:w1", "block_ids": [self._made_block("block:b1", "window:w1")]}]}
         if args[:2] == ["window", "new"]:
-            return {"window_id": "window:w2", "block_ids": ["block:b9"]}
+            return {"window_id": "window:w2", "block_ids": [self._made_block("block:b9", "window:w2")]}
         if args[:2] == ["window", "ls"]:
             return {"windows": self.windows}
         if args[0] == "split":
             self._block_seq += 1
-            return {"block_ids": [f"block:b{self._block_seq}"]}
+            source = args[args.index("-b") + 1]
+            window = next((b["window_id"] for b in self.blocks if b["block_id"] == source), None)
+            return {"block_ids": [self._made_block(f"block:b{self._block_seq}", window)]}
         if args[0] == "ls":
             return {"sessions": self.sessions}
         if args[:2] == ["block", "ls"]:
@@ -1248,15 +1315,12 @@ def test_rex_in_a_repo_adds_a_window_to_the_open_repo_session():
     assert rex.close_command(session) == "rex window close -s session:repo window:w2"
 
 
-def test_rex_team_count_ignores_other_windows_of_the_repo_session():
-    fake = FakeRexRunner(blocks=[
-        {"block_id": "block:a", "window_id": "window:mine"},
-        {"block_id": "block:b", "window_id": "window:other"},
-        {"block_id": "block:c", "window_id": "window:mine"},
-    ])
+def test_rex_never_counts_terminals_as_agents():
+    # Leftover shells are not a team; the running-team check uses `claude agents`.
+    fake = FakeRexRunner(blocks=[{"block_id": "block:a", "window_id": "window:mine"}])
     rex = cli.Rex(fake, git=FakeGit())
     rex.window = "window:mine"
-    assert [a["pane_id"] for a in rex.agents_in_workspace("session:repo")] == ["block:a", "block:c"]
+    assert rex.agents_in_workspace("session:repo") == []
 
 
 def test_rex_wait_for_output_stops_on_match_or_deadline():
@@ -1386,31 +1450,100 @@ def test_worktree_rex_open_starts_a_window_when_none_is_open(fake_rex):
     assert "worktree remove" not in result.stdout
 
 
-def test_worktree_rex_open_refuses_a_window_with_a_running_team(fake_rex):
-    fake, git = fake_rex(FakeRexRunner(
+def repo_session_with_branch_window():
+    """Rex already has the repo session `r` with a `me-br` window holding a terminal."""
+    return FakeRexRunner(
         sessions=[{"session_id": "session:repo", "label": "r"}],
         windows=[{"window_id": "window:br", "label": "me-br"}],
-        blocks=[
-            {"block_id": "block:x", "window_id": "window:br"},
-            {"block_id": "block:y", "window_id": "window:other"},
-        ],
-    ))
+        blocks=[{"block_id": "block:x", "window_id": "window:br"}],
+    )
+
+
+def test_worktree_rex_open_refuses_while_a_team_works_in_the_checkout(fake_rex, monkeypatch):
+    fake, git = fake_rex(repo_session_with_branch_window())
+    monkeypatch.setattr(cli, "fetch_agents", live(("Boss: me/br", "/r.worktrees/me-br")))
     result = runner.invoke(
         app, ["worktree", "me/br", "--repo", "/r", "--open", "--backend", "rex", "--no-wait"]
     )
     assert result.exit_code == 1
-    assert "already open in session session:repo with 1 agent(s)" in result.output
-    assert "rex window close -s session:repo window:br" in result.output
-    # nothing created, typed, or changed in git before the guard fired
+    assert "a team is already working in worktree me/br" in result.output
+    assert "  Boss: me/br" in result.output
+    assert "Go to it: rex focus -s session:repo window:br" in result.output
+    # nothing created, typed, or changed in git before the check fired
     assert not fake.made() and not fake.sends() and not git.mutations()
 
 
-def test_worktree_rex_open_force_adds_a_window_beside_the_running_team(fake_rex):
+def test_worktree_rex_open_points_at_the_newest_window_of_the_branch(fake_rex, monkeypatch):
+    # An exited team's window was left open and a fresh one made beside it:
+    # the running team is in the newer window (rex lists windows oldest first).
     fake, _ = fake_rex(FakeRexRunner(
         sessions=[{"session_id": "session:repo", "label": "r"}],
-        windows=[{"window_id": "window:br", "label": "me-br"}],
-        blocks=[{"block_id": "block:x", "window_id": "window:br"}],
+        windows=[{"window_id": "window:old", "label": "me-br"},
+                 {"window_id": "window:new", "label": "me-br"}],
     ))
+    monkeypatch.setattr(cli, "fetch_agents", live(("Boss: me/br", "/r.worktrees/me-br")))
+    result = runner.invoke(
+        app, ["worktree", "me/br", "--repo", "/r", "--open", "--backend", "rex", "--no-wait"]
+    )
+    assert result.exit_code == 1
+    assert "Go to it: rex focus -s session:repo window:new" in result.output
+
+
+def test_refusal_shows_how_to_attach_to_a_background_session(fake_rex, monkeypatch):
+    fake_rex()
+    monkeypatch.setattr(cli, "fetch_agents", lambda: [
+        {"kind": "background", "state": "done", "id": "0045c6d8",
+         "name": "Developer: me/br", "cwd": "/r.worktrees/me-br/pkg"},
+    ])
+    result = runner.invoke(
+        app, ["worktree", "me/br", "--repo", "/r", "--open", "--backend", "rex", "--no-wait"]
+    )
+    assert result.exit_code == 1
+    assert "Developer: me/br   (background: claude attach 0045c6d8)" in result.output
+
+
+def test_worktree_rex_open_refuses_a_session_working_in_a_subfolder(fake_rex, monkeypatch):
+    fake, _ = fake_rex()
+    monkeypatch.setattr(cli, "fetch_agents", live(("QA: me/br", "/r.worktrees/me-br/tests")))
+    result = runner.invoke(
+        app, ["worktree", "me/br", "--repo", "/r", "--open", "--backend", "rex", "--no-wait"]
+    )
+    assert result.exit_code == 1
+    assert "  QA: me/br" in result.output
+    assert "Go to it" not in result.output  # no rex window to point at
+    assert not fake.made()
+
+
+def test_worktree_rex_open_after_the_team_exited_starts_in_a_fresh_window(fake_rex):
+    # The old window still holds a terminal, but no Claude session runs there:
+    # the branch is free. The old window (and whatever runs in it) is left alone.
+    fake, _ = fake_rex(repo_session_with_branch_window())
+    result = runner.invoke(
+        app, ["worktree", "me/br", "--repo", "/r", "--open", "--backend", "rex", "--no-wait"]
+    )
+    assert result.exit_code == 0, result.output
+    assert fake.made()[0] == cli.rex_window_argv("session:repo", "/r.worktrees/me-br", "me-br")
+    assert not [c for c in fake.calls if "close" in c or c[0] == "kill"]
+    assert "an older window for me/br is still open: rex window close -s session:repo window:br" in result.stdout
+    assert "teardown: rex window close -s session:repo window:w2" in result.stdout
+
+
+def test_worktree_rex_open_warns_and_starts_when_claude_agents_fails(fake_rex, monkeypatch):
+    fake, _ = fake_rex(repo_session_with_branch_window())
+    monkeypatch.setattr(cli, "fetch_agents", lambda: None)
+    result = runner.invoke(
+        app, ["worktree", "me/br", "--repo", "/r", "--open", "--backend", "rex", "--no-wait"]
+    )
+    assert result.exit_code == 0, result.output
+    assert "couldn't check for a running team" in result.output
+    # unchecked, so we can't call the old window "older": it may hold a team
+    assert "older window" not in result.output
+    assert fake.sends()
+
+
+def test_worktree_rex_open_force_adds_a_window_beside_the_running_team(fake_rex, monkeypatch):
+    fake, _ = fake_rex(repo_session_with_branch_window())
+    monkeypatch.setattr(cli, "fetch_agents", live(("Boss: me/br", "/r.worktrees/me-br")))
     result = runner.invoke(
         app, ["worktree", "me/br", "--repo", "/r", "--open", "--force", "--backend", "rex", "--no-wait"]
     )
@@ -1421,6 +1554,7 @@ def test_worktree_rex_open_force_adds_a_window_beside_the_running_team(fake_rex)
     assert fake.sends()[0][0] == "block:b9"  # boss lands in the new window's block
     # teardown closes only our window, not the earlier team's
     assert "teardown: rex window close -s session:repo window:w2" in result.stdout
+    assert "older window" not in result.stdout  # that window holds a live team
 
 
 # --- quickstart: multiplexer detection ------------------------------------
