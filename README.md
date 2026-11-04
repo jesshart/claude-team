@@ -144,8 +144,12 @@ One gap: a session still waiting at Claude's "trust this folder" prompt isn't
 listed by `claude agents` yet, so it isn't detected. Trust is remembered for the
 whole repo, so this only happens the first time you use a repo Claude has never
 trusted.
-Because it opened a pre-existing worktree, teardown just closes the workspace
-(`herdr workspace close <ws>`) — it never removes the checkout or deletes the branch.
+If the worktree's workspace is already open (say, an earlier team exited and
+left its shells), the new team gets a **new tab** in it: existing panes are never
+typed into. Because it opened a pre-existing worktree, teardown just closes what
+this command opened — the workspace (`herdr workspace close <ws>`), or only the
+new tab (`herdr tab close <tab>`) — and never removes the checkout or deletes the
+branch.
 
 Both print the workspace id, the pane→role map with live status, and the exact
 teardown command:

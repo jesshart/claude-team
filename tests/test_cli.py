@@ -50,9 +50,10 @@ runner = CliRunner()
 class FakeHerdrRunner:
     """Records `herdr <args>` calls and returns canned JSON, no live server."""
 
-    def __init__(self):
+    def __init__(self, workspaces=()):
         self.calls = []
         self._pane_seq = 1
+        self.workspaces = list(workspaces)  # what `workspace list` reports
 
     def __call__(self, args):
         self.calls.append(args)
@@ -76,7 +77,15 @@ class FakeHerdrRunner:
             return {"pane": {"pane_id": f"w1:p{self._pane_seq}"}}
         if head == ["agent", "list"]:
             return {"agents": []}
+        if head == ["workspace", "list"]:
+            return {"type": "workspace_list", "workspaces": self.workspaces}
+        if head == ["tab", "create"]:
+            return {"tab": {"tab_id": "w3:t2"}, "root_pane": {"pane_id": "w3:p7"}}
         return {"type": "ok"}
+
+    def mutations(self):
+        """Every call except read-only listings."""
+        return [c for c in self.calls if c[-1] != "list" and c[:2] != ["workspace", "list"]]
 
     def pane_runs(self):
         """(pane_id, command) for each `pane run`, in call order."""
@@ -617,11 +626,29 @@ def test_herdr_create_worktree_returns_checkout():
     assert (ws, pane, checkout) == ("w2", "w2:p1", "/co")
 
 
-def test_herdr_open_worktree_returns_checkout():
+def test_herdr_open_worktree_returns_checkout(monkeypatch):
+    monkeypatch.setattr(cli, "default_git_runner", FakeGit(PORCELAIN, REPO_R))
     fake = FakeHerdrRunner()
-    ws, pane, checkout = Herdr(fake).open_worktree("/r", "b")
+    ws, pane, checkout = Herdr(fake).open_worktree("/r", "me/br")
     assert (ws, pane, checkout) == ("w3", "w3:p1", "/open")
-    assert fake.calls[0] == worktree_open_argv("/r", "b")
+    assert worktree_open_argv("/r", "me/br") in fake.calls
+    assert not [c for c in fake.calls if c[:2] == ["tab", "create"]]  # fresh workspace
+
+
+OPEN_W3 = [{"workspace_id": "w3", "label": "me-br", "worktree": {"checkout_path": "/r.worktrees/me-br"}}]
+
+
+def test_herdr_open_worktree_into_an_open_workspace_uses_a_new_tab(monkeypatch):
+    # The open workspace's root pane may still run something (an exited team's
+    # shell, a Claude at its trust prompt): never type into it.
+    monkeypatch.setattr(cli, "default_git_runner", FakeGit(PORCELAIN, REPO_R))
+    fake = FakeHerdrRunner(workspaces=OPEN_W3)
+    h = Herdr(fake)
+    ws, pane, _ = h.open_worktree("/r", "me/br")
+    assert (ws, pane) == ("w3", "w3:p7")
+    assert cli.tab_create_argv("w3", "/open", "me/br") in fake.calls
+    assert h.close_command(ws) == "herdr tab close w3:t2"  # teardown spares the other tabs
+    assert h.focus_hint(ws) == "herdr tab focus w3:t2"
 
 
 def test_herdr_split_returns_new_pane_id():
@@ -811,10 +838,29 @@ def test_worktree_open_refuses_while_a_claude_session_works_in_the_checkout(fake
     assert result.exit_code == 1
     assert "a team is already working in worktree me/br (/r.worktrees/me-br)" in result.output
     assert "  Boss: me/br" in result.output and "  Developer: me/br" in result.output
-    assert "Go to it: herdr worktree open --cwd /r --branch me/br" in result.output
+    assert "Go to it" not in result.output  # no workspace is open for it to point at
     assert "--force" in result.output
     # the check runs before herdr is asked to open (or create) anything
-    assert fake.calls == []
+    assert fake.mutations() == []
+
+
+def test_worktree_open_refusal_points_at_the_open_workspace(fake_herdr, monkeypatch):
+    fake = fake_herdr(FakeHerdrRunner(workspaces=OPEN_W3))
+    monkeypatch.setattr(cli, "fetch_agents", live(("Boss: me/br", "/r.worktrees/me-br")))
+    result = runner.invoke(app, ["worktree", "me/br", "--repo", "/r", "--open", "--no-wait"])
+    assert result.exit_code == 1
+    assert "Go to it: herdr workspace focus w3" in result.output
+    assert fake.mutations() == []
+
+
+def test_worktree_open_into_an_open_workspace_starts_in_a_new_tab(fake_herdr):
+    fake = fake_herdr(FakeHerdrRunner(workspaces=OPEN_W3))
+    result = runner.invoke(app, ["worktree", "me/br", "--repo", "/r", "--open", "--no-wait"])
+    assert result.exit_code == 0, result.output
+    assert fake.pane_runs()[0] == ("w3:p7", "claude-team boss me/br --model fable --fg")
+    assert "w3:p1" not in [p for p, _ in fake.pane_runs()]  # the old root pane is never typed into
+    assert "this team is in a new tab" in result.stdout
+    assert "teardown: herdr tab close w3:t2" in result.stdout
 
 
 def test_worktree_open_ignores_sessions_in_other_folders(fake_herdr, monkeypatch):

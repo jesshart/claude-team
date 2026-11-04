@@ -403,6 +403,10 @@ def worktree_open_argv(repo: str, branch: str) -> List[str]:
     return ["worktree", "open", "--cwd", repo, "--branch", branch, "--no-focus"]
 
 
+def tab_create_argv(workspace: str, cwd: str, label: str) -> List[str]:
+    return ["tab", "create", "--workspace", workspace, "--cwd", cwd, "--label", label, "--no-focus"]
+
+
 def pane_split_argv(pane: str, step: SplitStep, cwd: str) -> List[str]:
     argv = ["pane", "split", pane, "--direction", step.direction]
     if step.ratio is not None:
@@ -502,6 +506,9 @@ class Herdr:
     def __init__(self, runner: Optional[HerdrRunner] = None) -> None:
         # Resolve the module default at call time so tests can monkeypatch it.
         self._run = runner or default_herdr_runner
+        # Set when --open lands in an already-open workspace: the team gets a tab
+        # of its own there, and teardown closes only that tab.
+        self.tab: Optional[str] = None
 
     def _call(self, args: List[str]) -> dict:
         """Run one herdr command; return its ``.result`` payload or raise.
@@ -547,19 +554,36 @@ class Herdr:
         ``(workspace_id, root_pane_id, checkout_path)``.
 
         A worktree maps to a single workspace: opening one already open returns
-        that same workspace (its id + current root pane), it does not make a
-        second. Callers that mean to *populate* a fresh team must first check no
-        team is running in the checkout (see :func:`live_sessions_in`)."""
+        that same workspace and its current root pane, which may still be running
+        something (an exited team's shell, a Claude at its trust prompt, a dev
+        server). So when the workspace was already open, the team gets a new tab
+        in it and the root returned is that tab's pane; existing panes are never
+        typed into. Callers must first check no team is running in the checkout
+        (see :func:`live_sessions_in`)."""
+        existing = self.workspace_for(locate_worktree(repo, branch))
         r = self._call(worktree_open_argv(repo, branch))
         ws = r["workspace"]
         checkout = (ws.get("worktree") or {}).get("checkout_path", "")
-        return ws["workspace_id"], r["root_pane"]["pane_id"], checkout
+        root = r["root_pane"]["pane_id"]
+        if existing:
+            t = self._call(tab_create_argv(ws["workspace_id"], checkout or repo, branch))
+            self.tab, root = t["tab"]["tab_id"], t["root_pane"]["pane_id"]
+        return ws["workspace_id"], root, checkout
 
-    @staticmethod
-    def team_focus_hint(repo: str, branch: str, checkout: str) -> Optional[str]:
-        """A command that brings up the worktree's workspace: opening an
-        already-open worktree (without ``--no-focus``) focuses it."""
-        return shlex.join(["herdr", *worktree_open_argv(repo, branch)[:-1]])
+    def workspace_for(self, checkout: str) -> Optional[str]:
+        """The id of the open workspace bound to ``checkout``, if any (read-only)."""
+        for w in self._call(["workspace", "list"]).get("workspaces", []):
+            path = (w.get("worktree") or {}).get("checkout_path")
+            if path and os.path.realpath(path) == os.path.realpath(checkout):
+                return w["workspace_id"]
+        return None
+
+    def team_focus_hint(self, repo: str, branch: str, checkout: str) -> Optional[str]:
+        """A command that brings up the workspace of the team running in
+        ``checkout``, or ``None`` if no workspace is open for it (a background
+        session, say)."""
+        ws = self.workspace_for(checkout)
+        return self.focus_hint(ws) if ws else None
 
     def split(self, pane: str, step: SplitStep, cwd: str) -> str:
         """Split ``pane`` per ``step``; return the new pane's id."""
@@ -603,16 +627,24 @@ class Herdr:
     def split_line(ref: str, step: SplitStep, cwd: str) -> str:
         return "herdr " + " ".join(pane_split_argv(ref, step, cwd))
 
-    @staticmethod
-    def focus_hint(ws_id: str) -> str:
+    def focus_hint(self, ws_id: str) -> str:
+        if self.tab:
+            return f"herdr tab focus {self.tab}"
         return f"herdr workspace focus {ws_id}"
 
-    @staticmethod
-    def close_command(ws_id: str) -> str:
+    def close_command(self, ws_id: str) -> str:
+        if self.tab:
+            return f"herdr tab close {self.tab}"
         return f"herdr workspace close {ws_id}"
 
     def open_teardown(self, ws_id: str) -> str:
         return self.close_command(ws_id)
+
+    def reuse_note(self, branch: str) -> Optional[str]:
+        """What to tell the user when the team went into an already-open workspace."""
+        if not self.tab:
+            return None
+        return f"{branch}'s workspace was already open: this team is in a new tab, other tabs left alone"
 
     @staticmethod
     def worktree_teardown(ws_id: str, repo: str, branch: str, checkout: str) -> str:
@@ -1013,6 +1045,10 @@ class Rex:
 
     def open_teardown(self, ws_id: str) -> str:
         return self.close_command(ws_id)
+
+    @staticmethod
+    def reuse_note(branch: str) -> Optional[str]:
+        return None  # rex's fresh-window note is built by `worktree` itself
 
     def worktree_teardown(self, ws_id: str, repo: str, branch: str, checkout: str) -> str:
         return (
@@ -1553,6 +1589,9 @@ def worktree(
         extra = f"opened existing worktree {branch}  ->  {checkout or '(worktree)'}"
         if leftover:
             extra += f"\n  an older {mux.worktree_unit} for {branch} is still open: {leftover}"
+        note = mux.reuse_note(branch)
+        if note:
+            extra += f"\n  {note}"
     else:
         teardown = mux.worktree_teardown(ws_id, repo_path, branch, checkout)
         extra = f"branch {branch} @ {base}  ->  {checkout or '(worktree)'}"
