@@ -1510,9 +1510,14 @@ def worktree(
     force: bool = typer.Option(
         False,
         "--force",
-        help="With --open, launch even if a Claude session is already working in "
-        "the worktree's folder. Default: refuse, since two teams in one folder "
-        "would overwrite each other's work.",
+        help="Skip the running-team checks (name clashes, and --exclusive).",
+    ),
+    exclusive: bool = typer.Option(
+        False,
+        "--exclusive",
+        help="With --open, refuse if a Claude session is already working in the "
+        "worktree. Default: start alongside it (e.g. a handoff overlapping the "
+        "outgoing team).",
     ),
     topic: Optional[str] = typer.Option(
         None, "--topic", help="Team topic / session-name stem (default: the branch name)."
@@ -1533,8 +1538,10 @@ def worktree(
 ) -> None:
     """Create (or, with --open, reuse an existing) git worktree and launch a team on it.
 
-    One worktree folder holds one team: --open refuses while a live Claude session
-    (per `claude agents`) is working in the checkout, unless --force is given.
+    Teams may share a worktree: with --open, a team already working in the
+    checkout (per `claude agents`) is reported and the new team starts beside it,
+    in its own window / tab. A live session already using one of the new team's
+    names is refused (use --suffix). --exclusive refuses any team already there.
     """
     if not branch.strip():
         raise typer.BadParameter("BRANCH must not be empty.")
@@ -1559,22 +1566,29 @@ def worktree(
         raise typer.Exit()
 
     mux = open_backend(kind.name)
-    leftover = None
+    leftover, here = None, []
     try:
         if open_existing:
-            # Check the folder BEFORE opening anything, so a refusal leaves nothing behind.
+            # Check BEFORE opening anything, so a refusal leaves nothing behind.
             located = locate_worktree(repo_path, branch)
-            checked = not force and refuse_if_team_running(mux, repo_path, branch, located)
+            checked, here = (False, []) if force else check_running_teams(
+                mux, repo_path, branch, located, selected, team_topic, suffix, exclusive
+            )
             ws_id, root_pane, checkout = mux.open_worktree(repo_path, branch)
             if root_pane is None:
-                # Rex found the worktree's window still open. No team is running
-                # in it (or --force), so give this team a fresh window and leave
-                # the old one, and anything still running there, alone.
-                if checked:
+                # Rex found the worktree's window still open: give this team a
+                # fresh window and leave the old one, and anything running in it,
+                # alone. If nobody is working there, the old window is leftover.
+                if checked and not here:
                     leftover = mux.close_command(ws_id)
                 root_pane = mux.add_window(checkout or located)
             checkout = checkout or located
         else:
+            # A new worktree's folder is empty, but its names can still clash.
+            if not force:
+                check_running_teams(
+                    mux, repo_path, branch, "", selected, team_topic, suffix, exclusive=False
+                )
             ws_id, root_pane, checkout = mux.create_worktree(repo_path, branch, base, ws_label)
         placements = place_team(
             mux, strategy, root_pane, checkout or repo_path, selected, team_topic, suffix, invocation, prompts, models
@@ -1592,46 +1606,90 @@ def worktree(
         note = mux.reuse_note(branch)
         if note:
             extra += f"\n  {note}"
+        if here:
+            names = ", ".join(a.get("name") or "a Claude session" for a in here)
+            extra += f"\n  working alongside: {names}"
     else:
         teardown = mux.worktree_teardown(ws_id, repo_path, branch, checkout)
         extra = f"branch {branch} @ {base}  ->  {checkout or '(worktree)'}"
     report_team(mux, ws_id, placements, wait, teardown=teardown, extra=extra)
 
 
-def refuse_if_team_running(mux, repo: str, branch: str, checkout: str) -> bool:
-    """Exit 1 if a live Claude session is working in ``checkout``; return
-    whether the check could run (``False``: it was skipped with a warning).
+def session_line(a: dict) -> str:
+    """One live session for a message: its name, and how to reach it if it runs
+    in the background."""
+    line = f"  {a.get('name') or 'a Claude session'}"
+    if a.get("kind") == "background" and a.get("id"):
+        line += f"   (background: claude attach {a['id']})"
+    return line
 
-    One folder holds one team; a second would overwrite the first's files and
-    commits. If ``claude agents`` can't be run, warn and let the launch go on: a
-    broken check must not block starting a team."""
+
+def free_suffix(roles: List[Role], topic: str, taken: set) -> str:
+    """The first ``Handoff N`` suffix that gives every role a name not in ``taken``."""
+    n = 1
+    while any(build_name(r, topic, f"Handoff {n}").casefold() in taken for r in roles):
+        n += 1
+    return f"Handoff {n}"
+
+
+def check_running_teams(
+    mux,
+    repo: str,
+    branch: str,
+    checkout: str,
+    roles: List[Role],
+    topic: str,
+    suffix: Optional[str],
+    exclusive: bool,
+) -> Tuple[bool, List[dict]]:
+    """Look at the live Claude sessions before launching a team into ``checkout``.
+
+    Teams may share a worktree (a handoff overlaps the outgoing team), so a team
+    already working there is reported, not refused, unless ``exclusive``. What
+    is refused is a name clash: a live session already using a name this team
+    would take, which makes "check in with boss" and attaching ambiguous.
+
+    Return ``(checked, already_here)``: whether ``claude agents`` could be read
+    (if not, warn and let the launch go on), and the sessions already working
+    in the checkout."""
     agents = fetch_agents()
     if agents is None:
         typer.echo(
-            "warning: couldn't check for a running team (`claude agents` failed); "
+            "warning: couldn't check for running teams (`claude agents` failed); "
             "starting anyway.",
             err=True,
         )
-        return False
-    live = live_sessions_in(checkout, agents)
-    if not live:
-        return True
-    lines = [f"error: a team is already working in worktree {branch} ({checkout}):"]
-    for a in live:
-        line = f"  {a.get('name') or 'a Claude session'}"
-        if a.get("kind") == "background" and a.get("id"):
-            line += f"   (background: claude attach {a['id']})"
-        lines.append(line)
-    lines.append("Two teams in one folder would overwrite each other's work.")
-    try:
-        hint = mux.team_focus_hint(repo, branch, checkout)
-    except BackendError:
-        hint = None
-    if hint:
-        lines.append(f"Go to it: {hint}")
-    lines.append("Stop that team first, or pass --force to start another anyway.")
-    typer.echo("\n".join(lines), err=True)
-    raise typer.Exit(1)
+        return False, []
+    taken = {(a.get("name") or "").strip().casefold() for a in agents}
+    clashes = [
+        a for a in agents
+        if (a.get("name") or "").strip().casefold()
+        in {build_name(r, topic, suffix).casefold() for r in roles}
+    ]
+    if clashes:
+        lines = ["error: this team's names are already in use by live sessions:"]
+        lines += [f"{session_line(a)}   in {a.get('cwd', '?')}" for a in clashes]
+        lines.append(
+            "Two sessions with one name make \"check in with boss\" and attaching ambiguous."
+        )
+        lines.append(f'Give the new team distinct names: --suffix "{free_suffix(roles, topic, taken)}"')
+        typer.echo("\n".join(lines), err=True)
+        raise typer.Exit(1)
+    here = live_sessions_in(checkout, agents) if checkout else []
+    if here and exclusive:
+        lines = [f"error: a team is already working in worktree {branch} ({checkout}):"]
+        lines += [session_line(a) for a in here]
+        try:
+            hint = mux.team_focus_hint(repo, branch, checkout)
+        except BackendError:
+            hint = None
+        if hint:
+            lines.append(f"Go to it: {hint}")
+        lines.append("--exclusive allows only one team per worktree. Stop that team first, "
+                     "or drop --exclusive to work alongside it.")
+        typer.echo("\n".join(lines), err=True)
+        raise typer.Exit(1)
+    return True, here
 
 
 def render_quickstart(state: dict) -> str:
