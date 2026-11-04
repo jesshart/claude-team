@@ -130,12 +130,26 @@ space — the difference between a *worktree-workspace* and a bare `space`:
 claude-team worktree me/proj-123-thing --repo ~/code/app --open   # reuse the existing checkout
 ```
 
-A git worktree maps to a single Herdr workspace, so `--open` on a worktree that
-already has a team reuses that workspace; the command **refuses** to add a second
-team into a workspace that already holds agents unless you pass `--force`. With
-`--open`, `--base` and `--label` are ignored (the worktree keeps its own label).
-Because it opened a pre-existing worktree, teardown just closes the workspace
-(`herdr workspace close <ws>`) — it never removes the checkout or deletes the branch.
+**One worktree, one team.** Two teams working in the same checkout would
+overwrite each other's files and commits, so `--open` first asks Claude
+(`claude agents`) whether any live session is working in the worktree's folder
+or a subfolder. If one is, the command **refuses**, creates nothing, names the
+sessions it found, and prints a command to go to them. Pass `--force` to start
+another team anyway. A team that has exited no longer counts, even if its
+terminals are still open. If `claude agents` can't run, the command warns and
+starts the team. With `--open`, `--base` and `--label` are ignored (the worktree
+keeps its own label).
+
+One gap: a session still waiting at Claude's "trust this folder" prompt isn't
+listed by `claude agents` yet, so it isn't detected. Trust is remembered for the
+whole repo, so this only happens the first time you use a repo Claude has never
+trusted.
+If the worktree's workspace is already open (say, an earlier team exited and
+left its shells), the new team gets a **new tab** in it: existing panes are never
+typed into. Because it opened a pre-existing worktree, teardown just closes what
+this command opened — the workspace (`herdr workspace close <ws>`), or only the
+new tab (`herdr tab close <tab>`) — and never removes the checkout or deletes the
+branch.
 
 Both print the workspace id, the pane→role map with live status, and the exact
 teardown command:
@@ -198,11 +212,13 @@ after its directory, which is `app`.
   `<repo>.worktrees/<branch>`, with `/` replaced by `-`. The checkout
   directory is also the window name, so `me/proj-123-thing` becomes the window
   `me-proj-123-thing`.
-- **`--open` finds the checkout with `git worktree list` and reuses that
-  worktree's window in the repo session, if one is open.** Rex doesn't detect
-  agents, so any terminal in that window counts as a running team. Unless you
-  pass `--force`, the command refuses to add to a window that already has one.
-  With `--force`, the new team gets a second window with the same name.
+- **`--open` finds the checkout with `git worktree list`.** If no window is
+  open for it, the team gets a new one in the repo session. If the worktree's
+  window is still open but no team is running there (for example, the agents
+  exited and only their terminals are left), the team gets a fresh window with
+  the same name. The old window, and anything still running in it, is left
+  alone; the report prints the command to close it. Whether a team is running
+  is decided by `claude agents`, never by counting Rex terminals.
 - **Teardown:** in a repo, `rex window close` closes the team's window and
   leaves the repo session and its other teams alone. The repo session stays
   in place, even empty, until you `rex kill` it. Outside a repo it's

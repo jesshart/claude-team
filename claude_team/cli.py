@@ -403,6 +403,10 @@ def worktree_open_argv(repo: str, branch: str) -> List[str]:
     return ["worktree", "open", "--cwd", repo, "--branch", branch, "--no-focus"]
 
 
+def tab_create_argv(workspace: str, cwd: str, label: str) -> List[str]:
+    return ["tab", "create", "--workspace", workspace, "--cwd", cwd, "--label", label, "--no-focus"]
+
+
 def pane_split_argv(pane: str, step: SplitStep, cwd: str) -> List[str]:
     argv = ["pane", "split", pane, "--direction", step.direction]
     if step.ratio is not None:
@@ -502,6 +506,9 @@ class Herdr:
     def __init__(self, runner: Optional[HerdrRunner] = None) -> None:
         # Resolve the module default at call time so tests can monkeypatch it.
         self._run = runner or default_herdr_runner
+        # Set when --open lands in an already-open workspace: the team gets a tab
+        # of its own there, and teardown closes only that tab.
+        self.tab: Optional[str] = None
 
     def _call(self, args: List[str]) -> dict:
         """Run one herdr command; return its ``.result`` payload or raise.
@@ -547,13 +554,36 @@ class Herdr:
         ``(workspace_id, root_pane_id, checkout_path)``.
 
         A worktree maps to a single workspace: opening one already open returns
-        that same workspace (its id + current root pane), it does not make a
-        second. Callers that mean to *populate* a fresh team must first check the
-        workspace is empty (see ``agents_in_workspace``)."""
+        that same workspace and its current root pane, which may still be running
+        something (an exited team's shell, a Claude at its trust prompt, a dev
+        server). So when the workspace was already open, the team gets a new tab
+        in it and the root returned is that tab's pane; existing panes are never
+        typed into. Callers must first check no team is running in the checkout
+        (see :func:`live_sessions_in`)."""
+        existing = self.workspace_for(locate_worktree(repo, branch))
         r = self._call(worktree_open_argv(repo, branch))
         ws = r["workspace"]
         checkout = (ws.get("worktree") or {}).get("checkout_path", "")
-        return ws["workspace_id"], r["root_pane"]["pane_id"], checkout
+        root = r["root_pane"]["pane_id"]
+        if existing:
+            t = self._call(tab_create_argv(ws["workspace_id"], checkout or repo, branch))
+            self.tab, root = t["tab"]["tab_id"], t["root_pane"]["pane_id"]
+        return ws["workspace_id"], root, checkout
+
+    def workspace_for(self, checkout: str) -> Optional[str]:
+        """The id of the open workspace bound to ``checkout``, if any (read-only)."""
+        for w in self._call(["workspace", "list"]).get("workspaces", []):
+            path = (w.get("worktree") or {}).get("checkout_path")
+            if path and os.path.realpath(path) == os.path.realpath(checkout):
+                return w["workspace_id"]
+        return None
+
+    def team_focus_hint(self, repo: str, branch: str, checkout: str) -> Optional[str]:
+        """A command that brings up the workspace of the team running in
+        ``checkout``, or ``None`` if no workspace is open for it (a background
+        session, say)."""
+        ws = self.workspace_for(checkout)
+        return self.focus_hint(ws) if ws else None
 
     def split(self, pane: str, step: SplitStep, cwd: str) -> str:
         """Split ``pane`` per ``step``; return the new pane's id."""
@@ -597,16 +627,24 @@ class Herdr:
     def split_line(ref: str, step: SplitStep, cwd: str) -> str:
         return "herdr " + " ".join(pane_split_argv(ref, step, cwd))
 
-    @staticmethod
-    def focus_hint(ws_id: str) -> str:
+    def focus_hint(self, ws_id: str) -> str:
+        if self.tab:
+            return f"herdr tab focus {self.tab}"
         return f"herdr workspace focus {ws_id}"
 
-    @staticmethod
-    def close_command(ws_id: str) -> str:
+    def close_command(self, ws_id: str) -> str:
+        if self.tab:
+            return f"herdr tab close {self.tab}"
         return f"herdr workspace close {ws_id}"
 
     def open_teardown(self, ws_id: str) -> str:
         return self.close_command(ws_id)
+
+    def reuse_note(self, branch: str) -> Optional[str]:
+        """What to tell the user when the team went into an already-open workspace."""
+        if not self.tab:
+            return None
+        return f"{branch}'s workspace was already open: this team is in a new tab, other tabs left alone"
 
     @staticmethod
     def worktree_teardown(ws_id: str, repo: str, branch: str, checkout: str) -> str:
@@ -680,9 +718,13 @@ def git_worktree_add_argv(repo: str, branch: str, base: str, path: str) -> List[
 
 
 def find_worktree(porcelain: str, branch: str) -> Optional[str]:
-    """The checkout path for ``branch`` in ``git worktree list --porcelain``."""
+    """The checkout path for ``branch`` in ``git worktree list --porcelain``.
+
+    Accepts ``-z`` output (NUL-separated fields), which keeps a path with a
+    newline in it whole; line-separated output would cut it short."""
     path = None
-    for line in porcelain.splitlines():
+    fields = porcelain.split("\0") if "\0" in porcelain else porcelain.splitlines()
+    for line in fields:
         if line.startswith("worktree "):
             path = line[len("worktree "):]
         elif line == f"branch refs/heads/{branch}":
@@ -691,6 +733,44 @@ def find_worktree(porcelain: str, branch: str) -> Optional[str]:
 
 
 Runner = Callable[[List[str]], "subprocess.CompletedProcess"]
+
+
+def locate_worktree(repo: str, branch: str, git: Optional[Runner] = None) -> str:
+    """The checkout path of ``branch``'s existing worktree of ``repo``.
+
+    Read-only (``git worktree list``), so ``--open`` can check the folder for a
+    running team before it asks a multiplexer to open or create anything."""
+    run = git or default_git_runner  # resolve at call time so tests can patch it
+    args = ["-C", repo, "worktree", "list", "--porcelain", "-z"]
+    try:
+        proc = run(args)
+    except OSError as exc:
+        raise BackendError(f"`git {shlex.join(args)}` failed: {exc}")
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip()
+        raise BackendError(f"`git {shlex.join(args)}` failed (rc={proc.returncode}): {detail}")
+    checkout = find_worktree(proc.stdout or "", branch)
+    if checkout is None:
+        raise BackendError(f"no worktree of {repo} has branch {branch} checked out")
+    return checkout
+
+
+def path_within(path: str, root: str) -> bool:
+    """Whether ``path`` is ``root`` or inside it, comparing real paths (macOS
+    reports ``/tmp/x`` as ``/private/tmp/x``). ``root-2`` is not inside ``root``."""
+    path, root = os.path.realpath(path), os.path.realpath(root)
+    return path == root or path.startswith(root.rstrip(os.sep) + os.sep)
+
+
+def live_sessions_in(folder: str, agents: List[dict]) -> List[dict]:
+    """The live Claude sessions (from ``claude agents --json``) working in
+    ``folder`` or a subfolder of it.
+
+    One folder holds one team: two teams in a checkout would overwrite each
+    other's files and commits. Every listed session counts whatever its state
+    (a background ``done`` session is idle, not gone); stopped or exited
+    sessions are not listed at all."""
+    return [a for a in agents if a.get("cwd") and path_within(a["cwd"], folder)]
 
 
 def default_rex_runner(args: List[str]) -> "subprocess.CompletedProcess":
@@ -819,24 +899,40 @@ class Rex:
         the worktree, in the repo's session); return
         ``(session_id, root_block_id, checkout_path)``.
 
-        Like a herdr worktree, the worktree maps to one window: if it is already
-        open, that window is the one checked for a running team and the root is
-        ``None`` — nothing is created until the caller has run that check, and
-        then :meth:`add_window` gives the new team a window of its own.
+        If no window is open for it, one is made (``root`` is its first block).
+        If one is already open, the root is ``None`` and nothing is created: the
+        caller decides what to do (:meth:`add_window` gives the new team a window
+        of its own, leaving the old one and whatever runs in it alone).
         """
-        listing = self._text("git", self._git, ["-C", repo, "worktree", "list", "--porcelain"])
-        checkout = find_worktree(listing, branch)
-        if checkout is None:
-            raise RexError(f"no worktree of {repo} has branch {branch} checked out")
+        checkout = locate_worktree(repo, branch, self._git)
         where = git_location(checkout, self._git)
-        session = self.find_session(where[0]) if where else None
-        window = self.find_window(session, where[1]) if session else None
+        session, window = self._find_worktree_window(where)
         if window is None:
             session, root = self.create_workspace(checkout, branch)
             return session, root, checkout
         self.session, self.window, self.window_label = session, window, where[1]
         self.shared_session = True
         return session, None, checkout
+
+    def _find_worktree_window(
+        self, where: Optional[Tuple[str, str]]
+    ) -> Tuple[Optional[str], Optional[str]]:
+        """``(session, window)`` already open for a ``(repo, worktree)``, read-only."""
+        session = self.find_session(where[0]) if where else None
+        window = self.find_window(session, where[1]) if session else None
+        return session, window
+
+    def team_focus_hint(self, repo: str, branch: str, checkout: str) -> Optional[str]:
+        """A command that brings up the window of the team running in
+        ``checkout``, or ``None`` if Rex has no window for it.
+
+        A worktree can have several windows of the same name: ``--open`` leaves
+        an old one (its team gone) in place and opens a fresh one. Rex lists
+        windows oldest first, so the running team is in the newest."""
+        where = git_location(checkout, self._git)
+        session = self.find_session(where[0]) if where else None
+        windows = self.find_windows(session, where[1]) if session else []
+        return f"rex focus -s {session} {windows[-1]}" if windows else None
 
     def find_session(self, label: str) -> Optional[str]:
         """The id of the first session labelled ``label``, if any."""
@@ -845,12 +941,18 @@ class Rex:
                 return s["session_id"]
         return None
 
+    def find_windows(self, session: str, label: str) -> List[str]:
+        """The ids of the windows in ``session`` labelled ``label``, oldest first."""
+        return [
+            w["window_id"]
+            for w in self._call(["window", "ls", "-s", session, "--json"]).get("windows", [])
+            if w.get("label") == label
+        ]
+
     def find_window(self, session: str, label: str) -> Optional[str]:
         """The id of the first window in ``session`` labelled ``label``, if any."""
-        for w in self._call(["window", "ls", "-s", session, "--json"]).get("windows", []):
-            if w.get("label") == label:
-                return w["window_id"]
-        return None
+        windows = self.find_windows(session, label)
+        return windows[0] if windows else None
 
     def add_window(self, cwd: str, label: Optional[str] = None) -> str:
         """Open a new (unfocused) window in the current session; return its block.
@@ -870,18 +972,10 @@ class Rex:
         self._call(rex_send_argv(self.session, pane, command))
 
     def agents_in_workspace(self, ws_id: str) -> List[dict]:
-        """The blocks in this team's window of ``ws_id`` (the whole session if
-        no window is known yet).
-
-        Rex does not recognize agents itself, so any terminal in a worktree's
-        window counts as its team: the window exists only to hold one. Scoping
-        to the window keeps the repo's other worktrees out of the count."""
-        blocks = self._call(["block", "ls", "-s", ws_id, "--json"]).get("blocks", [])
-        return [
-            {"pane_id": b["block_id"]}
-            for b in blocks
-            if not self.window or b.get("window_id") == self.window
-        ]
+        """Agent statuses for the report: none, since Rex does not recognize
+        agents. Whether a team is running is checked from ``claude agents``
+        (see :func:`live_sessions_in`), never by counting Rex terminals."""
+        return []
 
     def wait_for_output(self, pane: str, regex: str, timeout_ms: int) -> None:
         """Best-effort poll of the block's screen for ``regex``; never fatal."""
@@ -951,6 +1045,10 @@ class Rex:
 
     def open_teardown(self, ws_id: str) -> str:
         return self.close_command(ws_id)
+
+    @staticmethod
+    def reuse_note(branch: str) -> Optional[str]:
+        return None  # rex's fresh-window note is built by `worktree` itself
 
     def worktree_teardown(self, ws_id: str, repo: str, branch: str, checkout: str) -> str:
         return (
@@ -1412,8 +1510,9 @@ def worktree(
     force: bool = typer.Option(
         False,
         "--force",
-        help="With --open, launch even if the worktree's workspace already holds "
-        "agents (its team). Default: refuse, to avoid clobbering a running team.",
+        help="With --open, launch even if a Claude session is already working in "
+        "the worktree's folder. Default: refuse, since two teams in one folder "
+        "would overwrite each other's work.",
     ),
     topic: Optional[str] = typer.Option(
         None, "--topic", help="Team topic / session-name stem (default: the branch name)."
@@ -1434,9 +1533,8 @@ def worktree(
 ) -> None:
     """Create (or, with --open, reuse an existing) git worktree and launch a team on it.
 
-    A git worktree maps to a single Herdr workspace / Rex session, so --open on a
-    worktree that already has a team reuses it; the guard refuses to add a second
-    team into it unless --force is given.
+    One worktree folder holds one team: --open refuses while a live Claude session
+    (per `claude agents`) is working in the checkout, unless --force is given.
     """
     if not branch.strip():
         raise typer.BadParameter("BRANCH must not be empty.")
@@ -1461,23 +1559,21 @@ def worktree(
         raise typer.Exit()
 
     mux = open_backend(kind.name)
+    leftover = None
     try:
         if open_existing:
+            # Check the folder BEFORE opening anything, so a refusal leaves nothing behind.
+            located = locate_worktree(repo_path, branch)
+            checked = not force and refuse_if_team_running(mux, repo_path, branch, located)
             ws_id, root_pane, checkout = mux.open_worktree(repo_path, branch)
-            if not force:
-                existing = mux.agents_in_workspace(ws_id)
-                if existing:
-                    typer.echo(
-                        f"error: worktree {branch} is already open in {mux.noun} {ws_id} "
-                        f"with {len(existing)} agent(s). A worktree maps to one {mux.worktree_unit}, "
-                        f"so this would add a team into the running one. Close it first "
-                        f"({mux.close_command(ws_id)}) or pass --force.",
-                        err=True,
-                    )
-                    raise typer.Exit(1)
             if root_pane is None:
-                # Rex reused the worktree's open session: give this team a window.
-                root_pane = mux.add_window(checkout or repo_path)
+                # Rex found the worktree's window still open. No team is running
+                # in it (or --force), so give this team a fresh window and leave
+                # the old one, and anything still running there, alone.
+                if checked:
+                    leftover = mux.close_command(ws_id)
+                root_pane = mux.add_window(checkout or located)
+            checkout = checkout or located
         else:
             ws_id, root_pane, checkout = mux.create_worktree(repo_path, branch, base, ws_label)
         placements = place_team(
@@ -1491,10 +1587,51 @@ def worktree(
         # it must not remove the checkout or delete the branch.
         teardown = mux.open_teardown(ws_id)
         extra = f"opened existing worktree {branch}  ->  {checkout or '(worktree)'}"
+        if leftover:
+            extra += f"\n  an older {mux.worktree_unit} for {branch} is still open: {leftover}"
+        note = mux.reuse_note(branch)
+        if note:
+            extra += f"\n  {note}"
     else:
         teardown = mux.worktree_teardown(ws_id, repo_path, branch, checkout)
         extra = f"branch {branch} @ {base}  ->  {checkout or '(worktree)'}"
     report_team(mux, ws_id, placements, wait, teardown=teardown, extra=extra)
+
+
+def refuse_if_team_running(mux, repo: str, branch: str, checkout: str) -> bool:
+    """Exit 1 if a live Claude session is working in ``checkout``; return
+    whether the check could run (``False``: it was skipped with a warning).
+
+    One folder holds one team; a second would overwrite the first's files and
+    commits. If ``claude agents`` can't be run, warn and let the launch go on: a
+    broken check must not block starting a team."""
+    agents = fetch_agents()
+    if agents is None:
+        typer.echo(
+            "warning: couldn't check for a running team (`claude agents` failed); "
+            "starting anyway.",
+            err=True,
+        )
+        return False
+    live = live_sessions_in(checkout, agents)
+    if not live:
+        return True
+    lines = [f"error: a team is already working in worktree {branch} ({checkout}):"]
+    for a in live:
+        line = f"  {a.get('name') or 'a Claude session'}"
+        if a.get("kind") == "background" and a.get("id"):
+            line += f"   (background: claude attach {a['id']})"
+        lines.append(line)
+    lines.append("Two teams in one folder would overwrite each other's work.")
+    try:
+        hint = mux.team_focus_hint(repo, branch, checkout)
+    except BackendError:
+        hint = None
+    if hint:
+        lines.append(f"Go to it: {hint}")
+    lines.append("Stop that team first, or pass --force to start another anyway.")
+    typer.echo("\n".join(lines), err=True)
+    raise typer.Exit(1)
 
 
 def render_quickstart(state: dict) -> str:
