@@ -828,18 +828,23 @@ def test_worktree_open_real_run_reports_and_uses_workspace_teardown(fake_herdr):
     assert fake.pane_runs()[0] == ("w3:p1", "claude-team boss me/br --model fable --fg")
 
 
-def test_worktree_open_refuses_while_a_claude_session_works_in_the_checkout(fake_herdr, monkeypatch):
+HANDOFF = ["--suffix", "Handoff 1"]
+
+
+def test_worktree_open_exclusive_refuses_a_team_in_the_checkout(fake_herdr, monkeypatch):
     fake = fake_herdr()
     monkeypatch.setattr(cli, "fetch_agents", live(
         ("Boss: me/br", "/r.worktrees/me-br"), ("Developer: me/br", "/r.worktrees/me-br/src"),
     ))
 
-    result = runner.invoke(app, ["worktree", "me/br", "--repo", "/r", "--open", "--no-wait"])
+    result = runner.invoke(
+        app, ["worktree", "me/br", "--repo", "/r", "--open", "--exclusive", *HANDOFF, "--no-wait"]
+    )
     assert result.exit_code == 1
     assert "a team is already working in worktree me/br (/r.worktrees/me-br)" in result.output
     assert "  Boss: me/br" in result.output and "  Developer: me/br" in result.output
     assert "Go to it" not in result.output  # no workspace is open for it to point at
-    assert "--force" in result.output
+    assert "drop --exclusive" in result.output
     # the check runs before herdr is asked to open (or create) anything
     assert fake.mutations() == []
 
@@ -847,7 +852,9 @@ def test_worktree_open_refuses_while_a_claude_session_works_in_the_checkout(fake
 def test_worktree_open_refusal_points_at_the_open_workspace(fake_herdr, monkeypatch):
     fake = fake_herdr(FakeHerdrRunner(workspaces=OPEN_W3))
     monkeypatch.setattr(cli, "fetch_agents", live(("Boss: me/br", "/r.worktrees/me-br")))
-    result = runner.invoke(app, ["worktree", "me/br", "--repo", "/r", "--open", "--no-wait"])
+    result = runner.invoke(
+        app, ["worktree", "me/br", "--repo", "/r", "--open", "--exclusive", *HANDOFF, "--no-wait"]
+    )
     assert result.exit_code == 1
     assert "Go to it: herdr workspace focus w3" in result.output
     assert fake.mutations() == []
@@ -888,7 +895,7 @@ def test_worktree_open_warns_and_launches_when_claude_agents_fails(fake_herdr, m
     monkeypatch.setattr(cli, "fetch_agents", lambda: None)
     result = runner.invoke(app, ["worktree", "me/br", "--repo", "/r", "--open", "--no-wait"])
     assert result.exit_code == 0, result.output
-    assert "couldn't check for a running team" in result.output
+    assert "couldn't check for running teams" in result.output
     assert fake.pane_runs()
 
 
@@ -1513,12 +1520,14 @@ def repo_session_with_branch_window():
     )
 
 
-def test_worktree_rex_open_refuses_while_a_team_works_in_the_checkout(fake_rex, monkeypatch):
+REX_EXCLUSIVE = ["worktree", "me/br", "--repo", "/r", "--open", "--exclusive", *HANDOFF,
+                 "--backend", "rex", "--no-wait"]
+
+
+def test_worktree_rex_open_exclusive_refuses_a_team_in_the_checkout(fake_rex, monkeypatch):
     fake, git = fake_rex(repo_session_with_branch_window())
     monkeypatch.setattr(cli, "fetch_agents", live(("Boss: me/br", "/r.worktrees/me-br")))
-    result = runner.invoke(
-        app, ["worktree", "me/br", "--repo", "/r", "--open", "--backend", "rex", "--no-wait"]
-    )
+    result = runner.invoke(app, REX_EXCLUSIVE)
     assert result.exit_code == 1
     assert "a team is already working in worktree me/br" in result.output
     assert "  Boss: me/br" in result.output
@@ -1536,9 +1545,7 @@ def test_worktree_rex_open_points_at_the_newest_window_of_the_branch(fake_rex, m
                  {"window_id": "window:new", "label": "me-br"}],
     ))
     monkeypatch.setattr(cli, "fetch_agents", live(("Boss: me/br", "/r.worktrees/me-br")))
-    result = runner.invoke(
-        app, ["worktree", "me/br", "--repo", "/r", "--open", "--backend", "rex", "--no-wait"]
-    )
+    result = runner.invoke(app, REX_EXCLUSIVE)
     assert result.exit_code == 1
     assert "Go to it: rex focus -s session:repo window:new" in result.output
 
@@ -1549,19 +1556,15 @@ def test_refusal_shows_how_to_attach_to_a_background_session(fake_rex, monkeypat
         {"kind": "background", "state": "done", "id": "0045c6d8",
          "name": "Developer: me/br", "cwd": "/r.worktrees/me-br/pkg"},
     ])
-    result = runner.invoke(
-        app, ["worktree", "me/br", "--repo", "/r", "--open", "--backend", "rex", "--no-wait"]
-    )
+    result = runner.invoke(app, REX_EXCLUSIVE)
     assert result.exit_code == 1
     assert "Developer: me/br   (background: claude attach 0045c6d8)" in result.output
 
 
-def test_worktree_rex_open_refuses_a_session_working_in_a_subfolder(fake_rex, monkeypatch):
+def test_worktree_rex_open_exclusive_counts_a_session_in_a_subfolder(fake_rex, monkeypatch):
     fake, _ = fake_rex()
     monkeypatch.setattr(cli, "fetch_agents", live(("QA: me/br", "/r.worktrees/me-br/tests")))
-    result = runner.invoke(
-        app, ["worktree", "me/br", "--repo", "/r", "--open", "--backend", "rex", "--no-wait"]
-    )
+    result = runner.invoke(app, REX_EXCLUSIVE)
     assert result.exit_code == 1
     assert "  QA: me/br" in result.output
     assert "Go to it" not in result.output  # no rex window to point at
@@ -1589,7 +1592,7 @@ def test_worktree_rex_open_warns_and_starts_when_claude_agents_fails(fake_rex, m
         app, ["worktree", "me/br", "--repo", "/r", "--open", "--backend", "rex", "--no-wait"]
     )
     assert result.exit_code == 0, result.output
-    assert "couldn't check for a running team" in result.output
+    assert "couldn't check for running teams" in result.output
     # unchecked, so we can't call the old window "older": it may hold a team
     assert "older window" not in result.output
     assert fake.sends()
@@ -1609,6 +1612,79 @@ def test_worktree_rex_open_force_adds_a_window_beside_the_running_team(fake_rex,
     # teardown closes only our window, not the earlier team's
     assert "teardown: rex window close -s session:repo window:w2" in result.stdout
     assert "older window" not in result.stdout  # that window holds a live team
+
+
+# --- teams sharing a worktree: overlap by default, names must not clash ----
+def test_worktree_rex_open_starts_a_handoff_team_alongside_the_running_one(fake_rex, monkeypatch):
+    # A handoff: the outgoing team is still working in the worktree.
+    fake, _ = fake_rex(repo_session_with_branch_window())
+    monkeypatch.setattr(cli, "fetch_agents", live(
+        ("Boss: me/br", "/r.worktrees/me-br"), ("Developer: me/br", "/r.worktrees/me-br"),
+    ))
+    result = runner.invoke(app, [
+        "worktree", "me/br", "--repo", "/r", "--open", *HANDOFF, "--backend", "rex", "--no-wait",
+    ])
+    assert result.exit_code == 0, result.output
+    # its own window; the running team's window is not touched or called "older"
+    assert fake.made()[0] == cli.rex_window_argv("session:repo", "/r.worktrees/me-br", "me-br")
+    assert "working alongside: Boss: me/br, Developer: me/br" in result.stdout
+    assert "older window" not in result.stdout
+    assert fake.sends()[0][1].startswith("claude-team boss me/br --suffix 'Handoff 1'")
+
+
+def test_worktree_open_herdr_handoff_team_gets_its_own_tab(fake_herdr, monkeypatch):
+    fake = fake_herdr(FakeHerdrRunner(workspaces=OPEN_W3))
+    monkeypatch.setattr(cli, "fetch_agents", live(("Boss: me/br", "/r.worktrees/me-br")))
+    result = runner.invoke(
+        app, ["worktree", "me/br", "--repo", "/r", "--open", *HANDOFF, "--no-wait"]
+    )
+    assert result.exit_code == 0, result.output
+    assert fake.pane_runs()[0][0] == "w3:p7"  # the new tab's pane, not the running boss's
+    assert "working alongside: Boss: me/br" in result.stdout
+
+
+def test_worktree_open_refuses_a_name_already_in_use(fake_rex, monkeypatch):
+    fake, git = fake_rex(repo_session_with_branch_window())
+    monkeypatch.setattr(cli, "fetch_agents", live(("Boss: me/br", "/r.worktrees/me-br")))
+    result = runner.invoke(app, REXARGS_OPEN)
+    assert result.exit_code == 1
+    assert "this team's names are already in use" in result.output
+    assert "  Boss: me/br   in /r.worktrees/me-br" in result.output
+    assert '--suffix "Handoff 1"' in result.output
+    assert not fake.made() and not fake.sends() and not git.mutations()
+
+
+def test_name_clash_is_checked_everywhere_and_suggests_a_free_suffix(fake_rex, monkeypatch):
+    # Names are global handles: a clash in another folder counts too, case aside.
+    fake_rex()
+    monkeypatch.setattr(cli, "fetch_agents", live(
+        ("boss: ME/BR", "/elsewhere"), ("QA: me/br Handoff 1", "/elsewhere"),
+    ))
+    result = runner.invoke(app, REXARGS_OPEN)
+    assert result.exit_code == 1
+    assert '--suffix "Handoff 2"' in result.output  # Handoff 1 is taken by the QA
+
+
+def test_worktree_create_refuses_a_name_clash_before_touching_git(fake_rex, monkeypatch, tmp_path):
+    repo = str(tmp_path / "app")
+    fake, git = fake_rex(git=FakeGit(repos={repo: f"{repo}/.git"}))
+    monkeypatch.setattr(cli, "fetch_agents", live(("Boss: me/new", "/elsewhere")))
+    result = runner.invoke(
+        app, ["worktree", "me/new", "--repo", repo, "--backend", "rex", "--no-wait"]
+    )
+    assert result.exit_code == 1
+    assert '--suffix "Handoff 1"' in result.output
+    assert not git.mutations() and not fake.made()
+
+
+def test_worktree_open_force_skips_the_name_check(fake_rex, monkeypatch):
+    fake, _ = fake_rex()
+    monkeypatch.setattr(cli, "fetch_agents", live(("Boss: me/br", "/r.worktrees/me-br")))
+    result = runner.invoke(app, REXARGS_OPEN[:-1] + ["--force", "--no-wait"])
+    assert result.exit_code == 0, result.output
+
+
+REXARGS_OPEN = ["worktree", "me/br", "--repo", "/r", "--open", "--backend", "rex", "--no-wait"]
 
 
 # --- quickstart: multiplexer detection ------------------------------------
