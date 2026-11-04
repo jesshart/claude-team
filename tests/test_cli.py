@@ -1095,17 +1095,24 @@ class FakeRexRunner:
         stdout = out if isinstance(out, str) else (json.dumps(out) if out else "")
         return subprocess.CompletedProcess(args, 0, stdout=stdout, stderr="")
 
+    def _made_block(self, block_id, window_id):
+        # Like real rex, `block ls` lists every block that was created.
+        self.blocks.append({"block_id": block_id, "window_id": window_id})
+        return block_id
+
     def _result(self, args):
         if args[0] == "new":
             return {"session_id": "session:s1", "initial_windows": [
-                {"window_id": "window:w1", "block_ids": ["block:b1"]}]}
+                {"window_id": "window:w1", "block_ids": [self._made_block("block:b1", "window:w1")]}]}
         if args[:2] == ["window", "new"]:
-            return {"window_id": "window:w2", "block_ids": ["block:b9"]}
+            return {"window_id": "window:w2", "block_ids": [self._made_block("block:b9", "window:w2")]}
         if args[:2] == ["window", "ls"]:
             return {"windows": self.windows}
         if args[0] == "split":
             self._block_seq += 1
-            return {"block_ids": [f"block:b{self._block_seq}"]}
+            source = args[args.index("-b") + 1]
+            window = next((b["window_id"] for b in self.blocks if b["block_id"] == source), None)
+            return {"block_ids": [self._made_block(f"block:b{self._block_seq}", window)]}
         if args[0] == "ls":
             return {"sessions": self.sessions}
         if args[:2] == ["block", "ls"]:
@@ -1384,6 +1391,33 @@ def test_worktree_rex_open_starts_a_window_when_none_is_open(fake_rex):
     assert fake.made()[0] == cli.rex_new_argv("/r.worktrees/me-br", "r", "me-br")
     assert "teardown: rex window close -s session:s1 window:w1" in result.stdout
     assert "worktree remove" not in result.stdout
+
+
+def test_worktree_rex_open_adds_a_window_to_the_repo_session_when_none_is_open(fake_rex):
+    # Regression for #4: the window open_worktree just made must not count as a team.
+    fake, _ = fake_rex(FakeRexRunner(
+        sessions=[{"session_id": "session:repo", "label": "r"}],
+        windows=[{"window_id": "window:other", "label": "someone-else"}],
+        blocks=[{"block_id": "block:x", "window_id": "window:other"}],
+    ))
+    result = runner.invoke(
+        app, ["worktree", "me/br", "--repo", "/r", "--open", "--backend", "rex", "--no-wait"]
+    )
+    assert result.exit_code == 0, result.output
+    assert fake.made()[0] == cli.rex_window_argv("session:repo", "/r.worktrees/me-br", "me-br")
+    assert len([c for c in fake.made() if c[:2] == ["window", "new"]]) == 1
+    assert fake.sends()[0][0] == "block:b9"
+    assert "teardown: rex window close -s session:repo window:w2" in result.stdout
+
+
+def test_rex_agents_in_workspace_skips_its_own_blocks_but_counts_others():
+    fake = FakeRexRunner(sessions=[{"session_id": "session:repo", "label": "r"}])
+    rex = cli.Rex(runner=fake)
+    rex.session = "session:repo"
+    root = rex.add_window("/r", "me-br")
+    fake.blocks.append({"block_id": "block:foreign", "window_id": "window:w2"})
+    assert rex.agents_in_workspace("session:repo") == [{"pane_id": "block:foreign"}]
+    assert root == "block:b9"
 
 
 def test_worktree_rex_open_refuses_a_window_with_a_running_team(fake_rex):

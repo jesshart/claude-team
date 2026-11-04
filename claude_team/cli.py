@@ -760,6 +760,9 @@ class Rex:
         # A team in a shared repo session is closed by its window, never by
         # killing the session (which would take the repo's other teams too).
         self.shared_session = False
+        # Blocks this run made. They are never someone else's team, so the
+        # occupancy check in :meth:`agents_in_workspace` leaves them out.
+        self._own_blocks: set = set()
 
     def _text(self, tool: str, run: Runner, args: List[str]) -> str:
         proc = run(args)
@@ -802,7 +805,11 @@ class Rex:
         first = r["initial_windows"][0]
         self.session, self.window = r["session_id"], first["window_id"]
         self.window_label = window
-        return self.session, first["block_ids"][0]
+        return self.session, self._own(first["block_ids"][0])
+
+    def _own(self, block: str) -> str:
+        self._own_blocks.add(block)
+        return block
 
     def create_worktree(
         self, repo: str, branch: str, base: str, label: str
@@ -859,11 +866,11 @@ class Rex:
         self.window_label = label or self.window_label
         r = self._call(rex_window_argv(self.session, cwd, self.window_label))
         self.window = r["window_id"]
-        return r["block_ids"][0]
+        return self._own(r["block_ids"][0])
 
     def split(self, pane: str, step: SplitStep, cwd: str) -> str:
         """Split block ``pane`` per ``step``; return the new block's id."""
-        return self._call(rex_split_argv(self.session, pane, step, cwd))["block_ids"][0]
+        return self._own(self._call(rex_split_argv(self.session, pane, step, cwd))["block_ids"][0])
 
     def run_in_pane(self, pane: str, command: str) -> None:
         """Type ``command`` + Enter into block ``pane``'s shell."""
@@ -875,12 +882,15 @@ class Rex:
 
         Rex does not recognize agents itself, so any terminal in a worktree's
         window counts as its team: the window exists only to hold one. Scoping
-        to the window keeps the repo's other worktrees out of the count."""
+        to the window keeps the repo's other worktrees out of the count, and
+        blocks this run created (e.g. the root of a window ``open_worktree``
+        just opened) are left out so a fresh window reads as empty."""
         blocks = self._call(["block", "ls", "-s", ws_id, "--json"]).get("blocks", [])
         return [
             {"pane_id": b["block_id"]}
             for b in blocks
-            if not self.window or b.get("window_id") == self.window
+            if (not self.window or b.get("window_id") == self.window)
+            and b["block_id"] not in self._own_blocks
         ]
 
     def wait_for_output(self, pane: str, regex: str, timeout_ms: int) -> None:
